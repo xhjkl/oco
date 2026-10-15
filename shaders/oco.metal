@@ -1,0 +1,12 @@
+// Shared declarations precede kernels that consume the same weight and matrix ABI.
+#include "matrix/weights.metal"
+#include "matrix/vector.metal"
+#include "matrix/batch.metal"
+#include "experts/routing.metal"
+#include "experts/projections.metal"
+#include "elementwise.metal"
+#include "attention.metal"
+#include "attention_wide.metal"
+#include "attention_split.metal"
+#include "recurrent.metal"
+#include "argmax.metal"
