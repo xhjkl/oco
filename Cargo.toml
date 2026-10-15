@@ -1,0 +1,29 @@
+[package]
+name = "oco"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+description = "An inference engine"
+
+[dependencies]
+anyhow = "1"
+block2 = "0.6"
+bytemuck = { version = "1", features = ["derive"] }
+dispatch2 = "0.3.1"
+futures-channel = "0.3"
+half = "2"
+memmap2 = "0.9"
+objc2 = "0.6"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+
+[dev-dependencies]
+futures-lite = { version = "2.6", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[profile.release]
+lto = "thin"
+[profile.dev]
+opt-level = 2
