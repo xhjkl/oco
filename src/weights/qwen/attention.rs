@@ -88,8 +88,7 @@ impl QwenAttention {
             }
             let rows = output.len();
             let hidden = s.hidden.at(output.start * self.base.embedding.width * 2);
-            compute.add(&s.projected, hidden, rows);
-            compute.norm(&layer.post_norm, hidden, &s.norm, rows);
+            compute.add_norm(&layer.post_norm, &s.projected, hidden, &s.norm, rows);
             compute.feed_forward(&layer.ff, self.ffn_width, hidden, rows);
         }
     }

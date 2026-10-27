@@ -1,5 +1,7 @@
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 
 // GGUF format codes.
@@ -17,6 +19,18 @@ enum WeightFormat : uint {
 };
 
 constant uint weight_type [[function_constant(0)]];
+// Vector kernels may square the positive part of their input on load (relu² feed-forward).
+constant uint input_relu_sqr [[function_constant(2)]];
+#define RELU_SQR_INPUT (is_function_constant_defined(input_relu_sqr) && input_relu_sqr != 0)
+// Vector kernels may keep their results in FP32 (final logits, recurrent time steps).
+constant uint output_f32 [[function_constant(3)]];
+#define OUTPUT_F32 (is_function_constant_defined(output_f32) && output_f32 != 0)
+__attribute__((always_inline)) inline void store_result(device bfloat *y, uint i, float v) {
+    if (OUTPUT_F32)
+        reinterpret_cast<device float *>(y)[i] = v;
+    else
+        y[i] = bfloat(v);
+}
 
 __attribute__((always_inline)) inline float fp16(const device uchar *p) {
     return float(*reinterpret_cast<const device half *>(p));

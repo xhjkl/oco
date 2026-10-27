@@ -130,3 +130,40 @@ fn selected_tensors_require_aligned_complete_payloads() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn public_inspection_reports_storage_and_rejects_unsupported_models() -> Result<()> {
+    for architecture in ["qwen35", "gpt-oss", "qwen35moe"] {
+        let mut bytes = header(1, 2);
+        for (key, value) in [
+            ("general.architecture", architecture),
+            ("general.name", "fixture"),
+        ] {
+            string(&mut bytes, key);
+            bytes.extend(8u32.to_le_bytes());
+            string(&mut bytes, value);
+        }
+        string(&mut bytes, "token_embd.weight");
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend(64u64.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.resize(bytes.len().div_ceil(32) * 32 + 256, 0);
+        let fixture = Fixture::new(&bytes)?;
+        let info = crate::inspect(&fixture.0);
+        if architecture == "qwen35moe" {
+            assert!(info.is_err());
+            continue;
+        }
+        let info = info?;
+        assert_eq!(info.architecture, architecture);
+        assert_eq!(info.name, "fixture");
+        assert_eq!(info.parameters, 64);
+        assert_eq!(info.file_bytes, bytes.len() as u64);
+        bytes.pop();
+        std::fs::write(&fixture.0, &bytes)?;
+        let truncated = crate::inspect(&fixture.0);
+        assert!(truncated.is_err());
+    }
+    Ok(())
+}

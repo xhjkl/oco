@@ -244,6 +244,14 @@ impl Gguf {
         Ok(value)
     }
 
+    pub fn boolean(&self, key: &str) -> Result<bool> {
+        match self.value(key)? {
+            Value::Bool(value) => Ok(value),
+            Value::Unsigned(value) if value <= 1 => Ok(value == 1),
+            _ => bail!("expected boolean {key}"),
+        }
+    }
+
     pub fn optional_unsigned(&self, key: &str) -> Result<Option<u64>> {
         if !self.meta.contains_key(key) {
             return Ok(None);
@@ -273,6 +281,24 @@ impl Gguf {
         (0..count).map(|_| reader.string()).collect()
     }
 
+    /// Read an integer array of any GGUF element width as non-negative values.
+    pub fn unsigned_integers(&self, key: &str) -> Result<Vec<u64>> {
+        let field = self
+            .meta
+            .get(key)
+            .with_context(|| format!("missing metadata {key}"))?;
+        ensure!(field.kind == 9, "expected array metadata {key}");
+        let mut reader = Reader::new(&self.map[field.bytes.clone()]);
+        let (element, count) = reader.array_header()?;
+        (0..count)
+            .map(|_| match reader.value(element)? {
+                Value::Unsigned(value) => Ok(value),
+                Value::Signed(value) if value >= 0 => Ok(value as u64),
+                _ => bail!("expected unsigned integer array {key}"),
+            })
+            .collect()
+    }
+
     pub fn integers(&self, key: &str) -> Result<Vec<i32>> {
         let (mut reader, count) = self.array(key, 5)?;
         (0..count)
@@ -289,7 +315,7 @@ enum Value<'a> {
     Unsigned(u64),
     Signed(i64),
     Float(f64),
-    Bool,
+    Bool(bool),
     String(&'a str),
 }
 
@@ -426,7 +452,7 @@ impl<'a> Reader<'a> {
             7 => {
                 let v = self.bytes::<1>()?;
                 ensure!(v[0] <= 1, "invalid GGUF boolean");
-                Value::Bool
+                Value::Bool(v[0] == 1)
             }
             8 => Value::String(self.string()?),
             10 => {

@@ -15,6 +15,11 @@ fn gpt_oss_infers() -> Result<()> {
     infer("GPT_OSS_PATH", GPT_INPUT)
 }
 
+#[test]
+fn nemotron_infers() -> Result<()> {
+    infer("NEMOTRON_PATH", NEMOTRON_INPUT)
+}
+
 fn infer(variable: &str, input: &[u32]) -> Result<()> {
     let path =
         std::env::var_os(variable).with_context(|| format!("set {variable} to a GGUF file"))?;
@@ -108,6 +113,10 @@ fn infer(variable: &str, input: &[u32]) -> Result<()> {
 const QWEN_INPUT: &[u32] = &[
     248045, 846, 198, 814, 20139, 6653, 57154, 440, 264, 6237, 3010, 13, 248046, 198, 248045,
     74455, 198, 248068, 271, 248069, 271,
+];
+const NEMOTRON_INPUT: &[u32] = &[
+    10, 3263, 1010, 2525, 3300, 8942, 1307, 1261, 16094, 6373, 1046, 11, 1010, 10, 1503, 19464,
+    1010, 12, 13,
 ];
 const GPT_INPUT: &[u32] = &[
     200006, 17360, 200008, 3575, 553, 17554, 162016, 11, 261, 4410, 6439, 2359, 22203, 656, 7788,

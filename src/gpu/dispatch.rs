@@ -1,10 +1,13 @@
-use super::{Buffer, BufferRef, Pipeline};
+use super::{Buffer, BufferRef, Pipeline, profile};
 use anyhow::{Result, anyhow};
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
+use objc2_foundation::NSRange;
 use objc2_metal::*;
 use std::{cell::RefCell, collections::HashMap};
 
 const PARAMETER_PAGE: usize = 64 * 1024;
+/// Timestamps per submission when profiling; later dispatches go unstamped.
+const PROFILE_STAMPS: usize = 4096;
 
 /// Reusable command storage, leased exclusively until its GPU completion callback.
 /// Parameter pages keep every dispatch's constants at a distinct, stable GPU address.
@@ -19,6 +22,9 @@ pub struct CommandMemory {
     parameters: Vec<Buffer>,
     cursor: usize,
     weights: Option<std::sync::Arc<super::ResidentWeights>>,
+    /// Optional GPU timestamp heap and the label of each stamped dispatch, in order.
+    heap: Option<Retained<ProtocolObject<dyn MTL4CounterHeap>>>,
+    labels: Vec<String>,
 }
 
 // Moving exclusive ownership between encoding and completion threads; none of the
@@ -40,6 +46,14 @@ impl CommandMemory {
         let table = device.newArgumentTableWithDescriptor_error(&descriptor)?;
         let residency =
             device.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())?;
+        let heap = if profile::enabled() {
+            let descriptor = MTL4CounterHeapDescriptor::new();
+            descriptor.setType(MTL4CounterHeapType::Timestamp);
+            unsafe { descriptor.setCount(PROFILE_STAMPS) };
+            Some(device.newCounterHeapWithDescriptor_error(&descriptor)?)
+        } else {
+            None
+        };
         Ok(Self {
             allocator,
             command,
@@ -50,14 +64,39 @@ impl CommandMemory {
             parameters: Vec::new(),
             cursor: 0,
             weights,
+            heap,
+            labels: Vec::new(),
         })
     }
 
     pub fn begin(&mut self) {
         self.allocator.reset();
         self.cursor = 0;
+        self.labels.clear();
         self.command
             .beginCommandBufferWithAllocator(&self.allocator);
+    }
+
+    /// Read back this submission's timestamps after GPU completion and fold them into the profile.
+    pub fn resolve_profile(&mut self) {
+        let Some(heap) = &self.heap else { return };
+        if self.labels.is_empty() {
+            return;
+        }
+        let count = self.labels.len() + 1;
+        let data = unsafe { heap.resolveCounterRange(NSRange::new(0, count)) };
+        if let Some(data) = data {
+            let bytes = data.to_vec();
+            let stamps: Vec<u64> = bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| u64::from_le_bytes(*chunk))
+                .collect();
+            profile::record(&self.labels, &stamps);
+        }
+        unsafe { heap.invalidateCounterRange(NSRange::new(0, count)) };
+        self.labels.clear();
     }
 
     pub fn end(&self) {
@@ -132,6 +171,42 @@ impl Commands {
     pub fn resident(&self, buffer: &BufferRef) {
         self.memory.borrow_mut().retain(buffer);
     }
+
+    /// Stamp the submission start when profiling.
+    pub fn stamp_start(&self) {
+        let memory = self.memory.borrow();
+        if let Some(heap) = &memory.heap {
+            unsafe {
+                self.encoder.writeTimestampWithGranularity_intoHeap_atIndex(
+                    MTL4TimestampGranularity::Precise,
+                    heap,
+                    0,
+                );
+            }
+        }
+    }
+
+    /// Stamp the completion of the dispatch just encoded, attributing it to its pipeline.
+    fn stamp(&self, pipeline: &Pipeline) {
+        let mut memory = self.memory.borrow_mut();
+        let Some(heap) = &memory.heap else { return };
+        let index = memory.labels.len() + 1;
+        if index >= PROFILE_STAMPS {
+            return;
+        }
+        unsafe {
+            self.encoder.writeTimestampWithGranularity_intoHeap_atIndex(
+                MTL4TimestampGranularity::Precise,
+                heap,
+                index,
+            );
+        }
+        let label = pipeline
+            .label()
+            .map(|label| label.to_string())
+            .unwrap_or_else(|| "unnamed".to_owned());
+        memory.labels.push(label);
+    }
 }
 
 pub fn dispatch(
@@ -155,6 +230,7 @@ pub fn dispatch(
             depth: 1,
         },
     );
+    commands.stamp(pipeline);
 }
 
 /// Dispatch without waiting for earlier work; the caller guarantees independence from every
@@ -180,6 +256,7 @@ pub fn dispatch_concurrent(
             depth: 1,
         },
     );
+    commands.stamp(pipeline);
 }
 
 pub fn dispatch_indirect(
@@ -205,6 +282,7 @@ pub fn dispatch_indirect(
                 },
             );
     }
+    commands.stamp(pipeline);
 }
 
 /// Bind operands and copied parameters, ordering access unless the caller guarantees independence.

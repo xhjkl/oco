@@ -43,6 +43,10 @@ enum Execution {
         weights: Arc<qwen::hybrid::QwenHybrid>,
         memory: qwen::hybrid::Memory,
     },
+    Nemotron {
+        weights: Arc<nemotron::Nemotron>,
+        memory: nemotron::Memory,
+    },
 }
 
 impl Session {
@@ -77,6 +81,13 @@ impl Session {
             Architecture::QwenHybrid(weights) => {
                 let memory = qwen::hybrid::Memory::new(weights, capacity, prefill_rows)?;
                 Execution::QwenHybrid {
+                    weights: weights.clone(),
+                    memory,
+                }
+            }
+            Architecture::Nemotron(weights) => {
+                let memory = nemotron::Memory::new(weights, capacity, prefill_rows)?;
+                Execution::Nemotron {
                     weights: weights.clone(),
                     memory,
                 }
@@ -173,6 +184,7 @@ impl Session {
             Execution::GptOss { .. } | Execution::QwenAttention { .. } => &[],
             Execution::QwenDelta { memory, .. } => &memory.states,
             Execution::QwenHybrid { memory, .. } => &memory.recurrent,
+            Execution::Nemotron { memory, .. } => &memory.recurrent,
         };
         for state in recurrent {
             state.reset();

@@ -8,7 +8,7 @@
 pub mod selected;
 
 use super::{
-    Weights, gpt_oss,
+    Weights, gpt_oss, nemotron,
     operands::*,
     pipelines::{Builder, ElementwisePipelines},
     qwen,
@@ -282,6 +282,7 @@ pub(crate) fn load(file: &Gguf) -> Result<Weights> {
             let g = p.geometry()?;
             qwen::load(file, &p, g)?
         }
+        "nemotron_h_moe" => nemotron::load(file, &p)?,
         _ => bail!("unsupported architecture {prefix}"),
     };
     let tokenizer = Tokenizer::load(file, inner.base().embedding.vocabulary)?;
@@ -407,4 +408,26 @@ pub(crate) const METADATA: &[&str] = &[
     "qwen35.ssm.inner_size",
     "qwen35.ssm.state_size",
     "qwen35.ssm.conv_kernel",
+    "nemotron_h_moe.embedding_length",
+    "nemotron_h_moe.attention.head_count",
+    "nemotron_h_moe.attention.head_count_kv",
+    "nemotron_h_moe.attention.key_length",
+    "nemotron_h_moe.attention.value_length",
+    "nemotron_h_moe.attention.layer_norm_rms_epsilon",
+    "nemotron_h_moe.feed_forward_length",
+    "nemotron_h_moe.context_length",
+    "nemotron_h_moe.block_count",
+    "nemotron_h_moe.expert_count",
+    "nemotron_h_moe.expert_used_count",
+    "nemotron_h_moe.expert_feed_forward_length",
+    "nemotron_h_moe.expert_shared_feed_forward_length",
+    "nemotron_h_moe.expert_shared_count",
+    "nemotron_h_moe.expert_weights_norm",
+    "nemotron_h_moe.expert_weights_scale",
+    "nemotron_h_moe.rope.freq_base",
+    "nemotron_h_moe.ssm.conv_kernel",
+    "nemotron_h_moe.ssm.state_size",
+    "nemotron_h_moe.ssm.group_count",
+    "nemotron_h_moe.ssm.inner_size",
+    "nemotron_h_moe.ssm.time_step_rank",
 ];

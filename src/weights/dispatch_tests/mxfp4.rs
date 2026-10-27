@@ -28,7 +28,7 @@ fn routed_experts_preserve_half_products_and_route_boundaries() -> Result<()> {
     let gpu = Gpu::new()?;
     let mut builder = Builder::new(&gpu)?;
     let pipelines = builder.experts()?;
-    // Sparse experts and one overfull expert exercise both production indirect tile plans.
+    // Sparse experts and one overfull expert exercise partial and multi-tile plans.
     for batch in [17, 257] {
         check_experts(&gpu, &pipelines, batch, 96, 96, 65)?;
     }
@@ -144,12 +144,21 @@ fn check_decode_reference(
     for (route, &expert) in ids.iter().enumerate() {
         for row in 0..n {
             let offset = (expert as usize * n + row) * k;
-            for (output, shift) in [(&up, 1.0), (&gate, 0.0)] {
-                let bias = bf16::from_f32(bias[expert as usize * n + row] + shift).to_f64();
-                let reference = reference_dot(&coefficients[offset..offset + k], &bf_values, bias);
-                let actual = f64::from(f32::from_bits(output[GUARD + route * n + row]));
-                check_roundoff(actual, reference, k, false, route, row);
-            }
+            let up_bias = bf16::from_f32(bias[expert as usize * n + row] + 1.0).to_f64();
+            let up_reference = reference_dot(&coefficients[offset..offset + k], &bf_values, up_bias);
+            let actual_up = f64::from(f32::from_bits(up[GUARD + route * n + row]));
+            check_roundoff(actual_up, up_reference, k, false, route, row);
+            // The gate slot holds the clipped SwiGLU of (gate, up) computed from exact sums.
+            let gate_bias = bf16::from_f32(bias[expert as usize * n + row]).to_f64();
+            let (gate_sum, _) = reference_dot(&coefficients[offset..offset + k], &bf_values, gate_bias);
+            let g = gate_sum.min(7.0);
+            let u = up_reference.0.clamp(-6.0, 8.0);
+            let expected = g / (1.0 + (-1.702 * g).exp()) * u;
+            let actual = f64::from(f32::from_bits(gate[GUARD + route * n + row]));
+            assert!(
+                (actual - expected).abs() <= 1e-3 * expected.abs().max(1.0),
+                "activation route {route} row {row}: {actual} vs {expected}"
+            );
         }
     }
     {
@@ -351,15 +360,11 @@ fn check_experts(
         (2 * n.div_ceil(64)) as u32,
         down_n.div_ceil(64) as u32,
     ];
-    let (plan_pipeline, up_pipeline, down_pipeline) = if batch >= 256 {
-        (
-            &pipelines.route_plan_large,
-            &pipelines.up_large,
-            &pipelines.down_large,
-        )
-    } else {
-        (&pipelines.route_plan, &pipelines.up, &pipelines.down)
-    };
+    let (plan_pipeline, up_pipeline, down_pipeline) = (
+        &pipelines.route_plan,
+        &pipelines.up_tensor,
+        &pipelines.down_tensor,
+    );
     let submission = compute.submit(|encoder| {
         dispatch(
             encoder,

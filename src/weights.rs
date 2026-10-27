@@ -7,6 +7,7 @@ macro_rules! with_architecture {
             $enum::QwenAttention $bindings => $body,
             $enum::QwenDelta $bindings => $body,
             $enum::QwenHybrid $bindings => $body,
+            $enum::Nemotron $bindings => $body,
         }
     };
 }
@@ -18,6 +19,7 @@ mod dispatch_tests;
 pub(crate) mod generation;
 mod gpt_oss;
 mod load;
+mod nemotron;
 mod operands;
 mod pipelines;
 mod qwen;
@@ -47,6 +49,7 @@ enum Architecture {
     QwenAttention(Arc<qwen::attention::QwenAttention>),
     QwenDelta(Arc<qwen::delta::QwenDelta>),
     QwenHybrid(Arc<qwen::hybrid::QwenHybrid>),
+    Nemotron(Arc<nemotron::Nemotron>),
 }
 
 impl Architecture {

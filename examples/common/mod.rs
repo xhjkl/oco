@@ -37,11 +37,17 @@ pub fn prompt(tokenizer: &Tokenizer, question: &str) -> Result<Vec<u32>> {
         tokens.extend(tokenizer.encode("\n")?);
         tokens.push(start);
         tokens.extend(tokenizer.encode("assistant\n")?);
-        // Opening a completed thinking section requests a direct answer.
+        // Opening a completed thinking section requests a direct answer. Qwen pads the
+        // section with blank lines; Nemotron (recognizable by Tekken's markers) keeps it empty.
+        let padded = tokenizer.special_token("[INST]").is_none();
         tokens.push(special("<think>")?);
-        tokens.extend(tokenizer.encode("\n\n")?);
+        if padded {
+            tokens.extend(tokenizer.encode("\n\n")?);
+        }
         tokens.push(special("</think>")?);
-        tokens.extend(tokenizer.encode("\n\n")?);
+        if padded {
+            tokens.extend(tokenizer.encode("\n\n")?);
+        }
         return Ok(tokens);
     }
 

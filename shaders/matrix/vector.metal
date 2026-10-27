@@ -70,8 +70,10 @@ kernel void matvec(const device uchar *w [[buffer(0)]], const device bfloat *x [
                    uint3 group [[threadgroup_position_in_grid]],
                    uint tid [[thread_index_in_threadgroup]],
                    uint lane [[thread_index_in_simdgroup]],
-                   uint sg [[simdgroup_index_in_threadgroup]]) {
-    uint row = group.x * 32 + sg * 4, route = group.y;
+                   uint sg [[simdgroup_index_in_threadgroup]],
+                   uint3 launch [[threads_per_threadgroup]]) {
+    // Four rows per SIMD group; the launch size sets how many SIMD groups share a threadgroup.
+    uint row = (group.x * (launch.x / 32) + sg) * 4, route = group.y;
     uint expert = p.experts > 1 ? ids[route] : 0;
     uint input = p.experts > 1 && !p.route_major ? route / p.routes : route;
     float sums[4] = {0, 0, 0, 0};
@@ -115,6 +117,10 @@ kernel void matvec(const device uchar *w [[buffer(0)]], const device bfloat *x [
         for (uint k = lane * 4; k < p.k; k += 128) {
             float4 a =
                 float4(*reinterpret_cast<const device vec<bfloat, 4> *>(x + input * p.k + k));
+            if (RELU_SQR_INPUT) {
+                a = max(a, 0.0f);
+                a *= a;
+            }
 #pragma unroll
             for (uint r = 0; r < 4; ++r) {
                 if (row + r >= p.n)
@@ -137,7 +143,7 @@ kernel void matvec(const device uchar *w [[buffer(0)]], const device bfloat *x [
             if (p.experts > 1 && !p.route_major)
                 reinterpret_cast<device float *>(y)[route * p.n + row + r] = v;
             else
-                y[route * p.n + row + r] = bfloat(v);
+                store_result(y, route * p.n + row + r, v);
         }
     }
 }
@@ -151,10 +157,11 @@ matvec_q4(const device uchar *w [[buffer(0)]], const device bfloat *x [[buffer(1
           device bfloat *y [[buffer(2)]], const device float *bias [[buffer(3)]],
           const device uint *ids [[buffer(4)]], constant Matrix &p [[buffer(5)]],
           uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+          uint3 launch [[threads_per_threadgroup]]) {
     const uint block_bytes = weight_type == WeightFormat::Q4_0 ? 18 : 20;
     const uint code_offset = weight_type == WeightFormat::Q4_0 ? 2 : 4;
-    uint row = group.x * 32 + sg * 4, route = group.y;
+    uint row = (group.x * (launch.x / 32) + sg) * 4, route = group.y;
     uint expert = p.experts > 1 ? ids[route] : 0,
          input = p.experts > 1 && !p.route_major ? route / p.routes : route;
     uint blocks = p.k / 32;
@@ -175,6 +182,12 @@ matvec_q4(const device uchar *w [[buffer(0)]], const device bfloat *x [[buffer(1
         for (uint j = 0; j < 4; j++) {
             float a0 = as_type<float>(lo[j] << 16), a1 = as_type<float>(lo[j] & 0xffff0000u);
             float b0 = as_type<float>(hi[j] << 16), b1 = as_type<float>(hi[j] & 0xffff0000u);
+            if (RELU_SQR_INPUT) {
+                a0 = max(a0, 0.0f) * max(a0, 0.0f);
+                a1 = max(a1, 0.0f) * max(a1, 0.0f);
+                b0 = max(b0, 0.0f) * max(b0, 0.0f);
+                b1 = max(b1, 0.0f) * max(b1, 0.0f);
+            }
             sumy += (a0 + a1) + (b0 + b1);
             yl[2 * j] = a0;
             yl[2 * j + 1] = a1 * (1.0f / 256.0f);
@@ -207,10 +220,10 @@ matvec_q4(const device uchar *w [[buffer(0)]], const device bfloat *x [[buffer(1
     for (uint r = 0; r < 4; r++) {
         float v = simd_sum(sums[r]);
         if (lane == 0 && row + r < p.n)
-            y[route * p.n + row + r] =
-                bfloat(v + (p.has_bias ? float(bfloat(bias[expert * p.n + row + r] +
-                                                      (p.has_bias == 2 ? 1.0f : 0.0f)))
-                                       : 0));
+            store_result(y, route * p.n + row + r,
+                         v + (p.has_bias ? float(bfloat(bias[expert * p.n + row + r] +
+                                                        (p.has_bias == 2 ? 1.0f : 0.0f)))
+                                         : 0));
     }
 }
 
@@ -269,7 +282,7 @@ matvec_q6k(const device uchar *w [[buffer(0)]], const device bfloat *x [[buffer(
             if (p.experts > 1 && !p.route_major)
                 reinterpret_cast<device float *>(y)[route * p.n + row + r] = v;
             else
-                y[route * p.n + row + r] = bfloat(v);
+                store_result(y, route * p.n + row + r, v);
         }
     }
 }
@@ -348,7 +361,7 @@ matvec_q5k(const device uchar *w [[buffer(0)]], const device bfloat *x [[buffer(
             if (p.experts > 1 && !p.route_major)
                 reinterpret_cast<device float *>(y)[route * p.n + row + r] = v;
             else
-                y[route * p.n + row + r] = bfloat(v);
+                store_result(y, route * p.n + row + r, v);
         }
     }
 }
@@ -377,5 +390,5 @@ kernel void matvec_split(const device uchar *w [[buffer(0)]], const device bfloa
     threadgroup_barrier(mem_flags::mem_threadgroup);
     sum = simd_sum(tid < 8 ? partial[tid] : 0);
     if (tid == 0)
-        y[group.y * p.n + row] = bfloat(sum + (p.has_bias ? float(bfloat(bias[row])) : 0));
+        store_result(y, group.y * p.n + row, sum + (p.has_bias ? float(bfloat(bias[row])) : 0));
 }

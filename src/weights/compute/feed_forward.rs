@@ -127,16 +127,12 @@ impl Bindings<'_> {
         let e = self.encoder;
         let s = self.scratch;
         let pipelines = &plan.pipelines;
-        // Reusing coefficients across more rows once the average expert has 32 routed inputs.
-        let (route_plan, up, down) = if rows >= 256 {
-            (
-                &pipelines.route_plan_large,
-                &pipelines.up_large,
-                &pipelines.down_large,
-            )
-        } else {
-            (&pipelines.route_plan, &pipelines.up, &pipelines.down)
-        };
+        // Tensor tiles cover 32 routes per expert and skip their empty upper half.
+        let (route_plan, up, down) = (
+            &pipelines.route_plan,
+            &pipelines.up_tensor,
+            &pipelines.down_tensor,
+        );
         let hidden = plan.up.k as usize;
         if rows == 1 {
             // Single tokens compute the 32 router logits across threadgroups; the expansion
@@ -220,12 +216,12 @@ impl Bindings<'_> {
             ];
             dispatch_indirect(e, up, &buffers, bytes_of(&p), routing.plan.at(0), 128);
         }
-        self.activate(rows * ACTIVE_EXPERTS * plan.width(), true);
         let p = Matrix {
             m: (rows * ACTIVE_EXPERTS) as u32,
             ..plan.down
         };
         if rows > 1 {
+            self.activate(rows * ACTIVE_EXPERTS * plan.width(), true);
             dispatch_indirect(
                 e,
                 down,
@@ -241,6 +237,7 @@ impl Bindings<'_> {
                 128,
             );
         } else {
+            // One token: the expansion already activated its outputs in place.
             dispatch(
                 e,
                 &pipelines.down_vector,

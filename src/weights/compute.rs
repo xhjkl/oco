@@ -6,6 +6,7 @@
 mod attention;
 mod feed_forward;
 mod matrix;
+mod nemotron;
 mod recurrent;
 mod submission;
 #[cfg(test)]
@@ -17,6 +18,7 @@ use crate::gpu::{BufferView, Gpu, ReadOnly, dispatch};
 pub use attention::{AttentionPlan, Rope};
 use bytemuck::{Pod, Zeroable, bytes_of};
 pub use feed_forward::ExpertPlan;
+pub use nemotron::{MambaPlan, ReluExpertPlan, plan_words};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTL4CommandQueue, MTLDevice};
 pub use recurrent::DeltaPlan;
@@ -71,6 +73,26 @@ impl Bindings<'_> {
             &[x, w.binding(), y.binding()],
             bytes_of(&self.base.norm),
             [m, 1, 1],
+            256,
+        );
+    }
+
+    /// Add a layer's contribution to the residual rows and normalize the result for the next
+    /// transformation in one pass.
+    pub fn add_norm(
+        &self,
+        w: &ReadOnly,
+        residual: &BufferView,
+        hidden: (&BufferRef, usize),
+        y: &BufferView,
+        rows: usize,
+    ) {
+        dispatch(
+            self.encoder,
+            &self.base.pipelines.add_norm,
+            &[hidden, residual.binding(), w.binding(), y.binding()],
+            bytes_of(&self.base.norm),
+            [rows, 1, 1],
             256,
         );
     }

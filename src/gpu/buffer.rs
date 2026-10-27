@@ -88,6 +88,16 @@ impl ReadOnly {
     pub fn binding(&self) -> (&BufferRef, usize) {
         (&self.buffer, self.offset)
     }
+
+    /// Narrow this view to a byte range within it.
+    pub fn slice(&self, offset: usize, length: usize) -> ReadOnly {
+        assert!(offset <= self.length && length <= self.length - offset);
+        ReadOnly {
+            buffer: self.buffer.clone(),
+            offset: self.offset + offset,
+            length,
+        }
+    }
 }
 
 /// Import-time lookup that lets selected tensors share page-aligned Metal registrations.

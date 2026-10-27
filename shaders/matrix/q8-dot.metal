@@ -6,9 +6,14 @@ q8_dot4(const device uchar *w, const device bfloat *x, uint k, uint rows, uint l
     for (uint block = lane / 2; block < k / 32; block += 16) {
         float4 a[4];
 #pragma unroll
-        for (uint j = 0; j < 4; j++)
+        for (uint j = 0; j < 4; j++) {
             a[j] = float4(*reinterpret_cast<const device vec<bfloat, 4> *>(
                 x + block * 32 + first + j * 4));
+            if (RELU_SQR_INPUT) {
+                a[j] = max(a[j], 0.0f);
+                a[j] *= a[j];
+            }
+        }
 #pragma unroll
         for (uint row = 0; row < 4; row++) {
             if (row >= rows)

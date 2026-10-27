@@ -46,6 +46,7 @@ impl Compute {
                 encoder,
                 memory: RefCell::new(memory),
             };
+            commands.stamp_start();
             encode(&commands);
             commands.encoder.endEncoding();
             let memory = commands.memory.into_inner();
@@ -73,6 +74,8 @@ impl Compute {
                         if let Some(error) = error {
                             return Err(anyhow!("Metal command failed: {error}"));
                         }
+                        let mut memory = memory;
+                        memory.resolve_profile();
                         if let Some(idle) = idle.upgrade() {
                             let mut idle = idle.lock().expect("command pool poisoned");
                             if idle.is_none() {

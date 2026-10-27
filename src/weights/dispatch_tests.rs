@@ -1,6 +1,8 @@
 mod attention;
 mod matrix_precision;
 mod mxfp4;
+mod nemotron;
+mod nemotron_bench;
 mod numerics;
 mod recurrent;
 

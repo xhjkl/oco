@@ -70,12 +70,12 @@ impl DenseMatrix {
     ) {
         debug_assert!(row < rows);
         let (pipeline, columns, threads) = match &self.plan {
-            DensePlan::Vector(v) => (&v.pipeline, v.column_groups, 256),
+            DensePlan::Vector(v) => (&v.pipeline, v.column_groups, v.threads),
             DensePlan::Tiled {
                 vector: v,
                 vector_rows,
                 ..
-            } if rows <= *vector_rows => (&v.pipeline, v.column_groups, 256),
+            } if rows <= *vector_rows => (&v.pipeline, v.column_groups, v.threads),
             DensePlan::Tiled { narrow, .. } => {
                 // Keeping the matrix reduction; the smallest tile avoids discarded query rows.
                 let tile = &narrow[0];
@@ -105,10 +105,10 @@ impl DenseMatrix {
             bias,
             scales,
         ];
-        let groups = if threads == 256 {
-            [columns, 1, 1]
-        } else {
+        let groups = if threads == 128 {
             [1, columns, 1]
+        } else {
+            [columns, 1, 1]
         };
         dispatch(
             compute.encoder,
@@ -123,7 +123,7 @@ impl DenseMatrix {
     /// `concurrent` skips the ordering barrier: the caller guarantees this product depends on
     /// nothing dispatched since the previous barrier, so it overlaps its predecessor.
     #[allow(clippy::too_many_arguments)]
-    fn apply(
+    pub(super) fn apply(
         &self,
         e: &Commands,
         bias: Option<&ReadOnly>,
@@ -160,7 +160,7 @@ impl DenseMatrix {
                     &buffers,
                     bytes_of(&p),
                     [v.column_groups, m, 1],
-                    256,
+                    v.threads,
                 );
                 return;
             }
@@ -173,7 +173,7 @@ impl DenseMatrix {
             } => {
                 if m <= *vector_rows {
                     let groups = [vector.column_groups, m, 1];
-                    first(e, &vector.pipeline, &buffers, bytes_of(&p), groups, 256);
+                    first(e, &vector.pipeline, &buffers, bytes_of(&p), groups, vector.threads);
                     return;
                 }
                 (narrow, wide)
@@ -373,7 +373,7 @@ impl Bindings<'_> {
             ],
             bytes_of(&p),
             [w.vector.column_groups, 1, 1],
-            256,
+            w.vector.threads,
         );
     }
 }

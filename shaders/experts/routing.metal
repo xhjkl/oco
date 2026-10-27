@@ -29,9 +29,7 @@ kernel void route_plan_tiled(const device uint *ids [[buffer(0)]], device uint *
     }
 }
 
-template [[host_name("route_plan")]] kernel void route_plan_tiled<16>(
-    const device uint *, device uint *, constant RoutePlan &, uint);
-template [[host_name("route_plan_large")]] kernel void route_plan_tiled<32>(
+template [[host_name("route_plan")]] kernel void route_plan_tiled<32>(
     const device uint *, device uint *, constant RoutePlan &, uint);
 
 // Keep top-four indices valid even when invalid arithmetic reaches the router.

@@ -10,7 +10,7 @@
 //! for every layer even when that layer's scratch is reused by the next one.
 
 use super::{
-    compute::{AttentionPlan, DeltaPlan},
+    compute::{AttentionPlan, DeltaPlan, MambaPlan},
     qwen::delta::{CONV_TAPS, KEY_WIDTH},
 };
 use crate::gpu::{
@@ -36,7 +36,7 @@ pub struct CommonScratch<S = BufferView> {
     pub projected: S,
     pub gate: S,
     pub up: S,
-    /// Vocabulary scores for GPU greedy selection after the final input row.
+    /// FP32 vocabulary scores for GPU greedy selection after the final input row.
     pub logits: S,
     /// Greedy next-token ID, reused directly as decode input without a CPU-to-GPU copy.
     pub next: S,
@@ -67,6 +67,42 @@ pub struct DeltaScratch<S = BufferView> {
     pub factors: S,
     /// Recurrent output before gated RMS normalization.
     pub values: S,
+}
+
+/// Per-chunk intermediates of a Mamba-2 block, from input projection to normalized output.
+pub struct MambaScratch<S = BufferView> {
+    /// Gate, convolution inputs, and time steps for every row.
+    pub projected: S,
+    /// Convolved and activated x/B/C columns, kept in FP32 for the recurrence.
+    pub convolved: S,
+    /// FP32 scan output including the skip term, before gating.
+    pub scanned: S,
+    /// Gated and group-normalized rows feeding the output projection.
+    pub mixed: S,
+    /// FP32 per-head time steps, projected separately from the BF16 gate and conv inputs.
+    pub dt: S,
+}
+
+impl MambaScratch<Slot> {
+    pub fn plan(p: &mut Plan, batch: usize, m: &MambaPlan) -> Result<Self> {
+        Ok(Self {
+            projected: p.slot(product(batch, m.projected_width())?, 2)?,
+            convolved: p.slot(product(batch, m.conv_width())?, 4)?,
+            scanned: p.slot(product(batch, m.inner_width())?, 4)?,
+            mixed: p.slot(product(batch, m.inner_width())?, 2)?,
+            dt: p.slot(product(batch, m.heads())?, 4)?,
+        })
+    }
+
+    pub fn bind(self, a: &Arena) -> MambaScratch {
+        MambaScratch {
+            projected: a.get(self.projected),
+            convolved: a.get(self.convolved),
+            scanned: a.get(self.scanned),
+            mixed: a.get(self.mixed),
+            dt: a.get(self.dt),
+        }
+    }
 }
 
 /// Expert selections and combination weights for dispatching each token to its chosen networks.
@@ -129,7 +165,7 @@ impl CommonScratch<Slot> {
                 product(product(rows, ffn_width)?, routes)?,
                 activation_bytes,
             )?,
-            logits: plan.slot(vocabulary, 2)?,
+            logits: plan.slot(vocabulary, 4)?,
             next: plan.slot(1, 4)?,
         })
     }
@@ -235,6 +271,17 @@ pub fn kv_states(
         slots.push(Kv {
             k: p.slot(elements, 2)?,
             v: p.slot(elements, 2)?,
+        });
+    }
+    Ok(slots)
+}
+
+pub fn mamba_states(p: &mut Plan, count: usize, m: &MambaPlan) -> Result<Vec<Recurrence<Slot>>> {
+    let mut slots = Vec::with_capacity(count);
+    for _ in 0..count {
+        slots.push(Recurrence {
+            conv: p.slot(product(m.conv_width(), CONV_TAPS - 1)?, 4)?,
+            ssm: p.slot(product(m.inner_width(), MambaPlan::STATE)?, 4)?,
         });
     }
     Ok(slots)

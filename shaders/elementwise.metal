@@ -29,6 +29,36 @@ kernel void norm(const device bfloat *x [[buffer(0)]], const device float *w [[b
     }
 }
 
+// Residual add followed by the next normalization in one pass: the summed row is stored back
+// to the residual stream and its normalized form written for the following transformation.
+kernel void add_norm(device bfloat *x [[buffer(0)]], const device bfloat *y [[buffer(1)]],
+                     const device float *w [[buffer(2)]], device bfloat *out [[buffer(3)]],
+                     constant Norm &p [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+                     uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float shared[32], inv;
+    float s = 0;
+    for (uint i = tid; tid < 256 && i < p.n; i += 256) {
+        bfloat summed = bfloat(float(x[row * p.n + i]) + float(y[row * p.n + i]));
+        x[row * p.n + i] = summed;
+        float v = float(summed);
+        s += v * v;
+    }
+    s = simd_sum(s);
+    if (lane == 0)
+        shared[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    s = simd_sum(tid < 8 ? shared[tid] : 0);
+    if (tid == 0)
+        inv = rsqrt(s / float(p.n) + p.epsilon);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; tid < 256 && i < p.n; i += 256) {
+        float normalized = float(x[row * p.n + i]) * inv;
+        out[row * p.n + i] = p.full_layer ? bfloat(normalized * w[i])
+                                          : bfloat(float(bfloat(normalized)) * float(bfloat(w[i])));
+    }
+}
+
 kernel void add(device bfloat *x [[buffer(0)]], const device bfloat *y [[buffer(1)]],
                 constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i < n)

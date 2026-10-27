@@ -149,6 +149,25 @@ impl Bindings<'_> {
             .apply(self, s.mixed.at(0), &self.scratch.projected, output.len());
     }
 
+    /// Position-free attention: store every input's keys and values, mix the requested rows.
+    pub fn plain_attention(
+        &self,
+        w: &AttentionProjections<Projection>,
+        plan: &AttentionPlan,
+        (s, state): (&AttentionScratch, &Kv),
+        positions: Range<usize>,
+        output: Range<usize>,
+    ) {
+        let m = positions.len();
+        self.project_qkv(w, s, m, output.clone());
+        self.attention(plan, (s, state), None, 0, positions, output.clone());
+        if output.is_empty() {
+            return;
+        }
+        w.out
+            .apply(self, s.mixed.at(0), &self.scratch.projected, output.len());
+    }
+
     /// Update history at the supplied sequence positions and gate the requested chunk-relative rows.
     pub fn gated_attention(
         &self,

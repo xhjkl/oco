@@ -35,6 +35,8 @@ pub struct Output {
 pub struct Vector {
     pub pipeline: Pipeline,
     pub column_groups: usize,
+    /// Threads per threadgroup; vector kernels derive their rows per group from it.
+    pub threads: usize,
 }
 
 pub struct Tile {
