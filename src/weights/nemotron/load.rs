@@ -7,7 +7,7 @@ use crate::{
     tensor::WeightFormat,
     weights::{
         Architecture,
-        common::{AttentionProjections, CommonWeights},
+        common::{AttentionProjections, CommonWeights, Kernels},
         compute::{AttentionPlan, MambaPlan, Norm, ReluExpertPlan, Rope},
         load::{Geometry, Import, Parameters, Selection, common_selection, common_weights, import},
         operands::{DenseMatrix, DensePlan, Projection, Router},
@@ -71,10 +71,16 @@ impl<'a> Selection<'a> {
             g.hidden,
             g.heads * g.dim,
         )?;
-        let k =
-            self.projection_with_optional_bias(&format!("{prefix}.attn_k"), g.hidden, g.kv * g.dim)?;
-        let v =
-            self.projection_with_optional_bias(&format!("{prefix}.attn_v"), g.hidden, g.kv * g.dim)?;
+        let k = self.projection_with_optional_bias(
+            &format!("{prefix}.attn_k"),
+            g.hidden,
+            g.kv * g.dim,
+        )?;
+        let v = self.projection_with_optional_bias(
+            &format!("{prefix}.attn_v"),
+            g.hidden,
+            g.kv * g.dim,
+        )?;
         let out = self.projection_with_optional_bias(
             &format!("{prefix}.attn_output"),
             g.heads * g.dim,
@@ -148,7 +154,10 @@ impl Import {
         let (block, size) = kind.block_layout();
         let row_bytes = hidden / block * size;
         let heads = in_proj.matrix.output - dt_rows_before;
-        let values = in_proj.matrix.values.slice(dt_rows_before * row_bytes, heads * row_bytes);
+        let values = in_proj
+            .matrix
+            .values
+            .slice(dt_rows_before * row_bytes, heads * row_bytes);
         let dt = DenseMatrix {
             values,
             input: hidden,
@@ -236,7 +245,9 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
         .context("Nemotron requires at least one attention block")?;
     let kv = usize::try_from(kv)?;
     ensure!(
-        kv_layers.iter().all(|&layer| layer == 0 || layer as usize == kv),
+        kv_layers
+            .iter()
+            .all(|&layer| layer == 0 || layer as usize == kv),
         "attention blocks must share one key/value head count"
     );
     let expert_width = p.integer("expert_feed_forward_length")?;
@@ -289,7 +300,10 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
         false
     };
     let scale = p.optional("expert_weights_scale", 1.0)? as f32;
-    ensure!(scale.is_finite() && scale > 0.0, "invalid expert weight scale");
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "invalid expert weight scale"
+    );
     let groups = p.integer("ssm.group_count")?;
     let ssm_heads = p.integer("ssm.time_step_rank")?;
     let inner = p.integer("ssm.inner_size")?;
@@ -317,21 +331,8 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
         expert_width,
         shared_width,
     };
-    let rope = Rope {
-        heads: heads as u32,
-        kv_heads: kv as u32,
-        dim: dim as u32,
-        // Nemotron attention carries no positional rotation.
-        rope_dim: 0,
-        m: 0,
-        pos: 0,
-        q_stride: 1,
-        base,
-        factor: 1.0,
-        low: 0.0,
-        high: 1.0,
-        scale: 1.0,
-    };
+    // Nemotron attention carries no positional rotation.
+    let rope = Rope::unrotated(heads, kv, dim);
     let directory = file.directory()?;
     let (mut s, common) = common_selection(&directory, &g)?;
     let mut selected = Vec::with_capacity(count);
@@ -381,7 +382,23 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
         }),
         "shared experts must share one weight encoding"
     );
-    let shared_vectors = i.builder.vector_pair(shared_kind)?;
+    ensure!(
+        matches!(
+            shared_kind,
+            WeightFormat::Q4_0
+                | WeightFormat::Q4_1
+                | WeightFormat::Q8_0
+                | WeightFormat::F32
+                | WeightFormat::F16
+                | WeightFormat::Bf16
+        ),
+        "unsupported shared expert encoding {shared_kind:?}"
+    );
+    let shared_vectors = (
+        i.builder
+            .vector_kernel(shared_kind, shared_width, false, false)?,
+        i.builder.vector_kernel(shared_kind, hidden, true, false)?,
+    );
     let experts = ReluExpertPlan::new(
         hidden,
         expert_width,
@@ -422,8 +439,7 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
         embedding,
         output,
         output_norm,
-        norm,
-        pipelines,
+        kernels: Kernels { pipelines, norm },
     };
     Ok(Architecture::Nemotron(Arc::new(Nemotron {
         base,

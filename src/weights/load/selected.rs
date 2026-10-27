@@ -3,7 +3,8 @@ use crate::gguf::Tensor;
 
 pub struct Common<'a> {
     pub embedding: Tensor<'a>,
-    pub output: Projection<'a, Option<Tensor<'a>>>,
+    /// Absent when the checkpoint ties the output projection to its embedding table.
+    pub output: Option<Projection<'a, Option<Tensor<'a>>>>,
     pub norm: Tensor<'a>,
 }
 

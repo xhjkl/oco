@@ -4,6 +4,7 @@
 //! positions and row counts explicitly; the bindings carry no sequence progress.
 
 mod attention;
+mod audio;
 mod feed_forward;
 mod matrix;
 mod nemotron;
@@ -12,10 +13,16 @@ mod submission;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use super::{common::CommonWeights, state::CommonScratch};
+use super::{common::Kernels, state::CommonScratch};
 use crate::gpu::{BufferRef, CommandMemory, Commands};
 use crate::gpu::{BufferView, Gpu, ReadOnly, dispatch};
+#[cfg(test)]
+pub(crate) use attention::AttentionParams;
 pub use attention::{AttentionPlan, Rope};
+pub use audio::{
+    Conv, EncoderLayer, GeluFfn, GeluForm, Im2col, LayerNorm, LayerNormWeights, half_bits,
+    repacked_matrix,
+};
 use bytemuck::{Pod, Zeroable, bytes_of};
 pub use feed_forward::ExpertPlan;
 pub use nemotron::{MambaPlan, ReluExpertPlan, plan_words};
@@ -49,7 +56,7 @@ impl Compute {
 /// Borrowed resource bindings shared by operations during one submission.
 /// Row selection and sequence positions belong to the caller, not these bindings.
 pub struct Bindings<'a> {
-    pub base: &'a CommonWeights,
+    pub kernels: &'a Kernels,
     pub scratch: &'a CommonScratch,
     pub encoder: &'a Commands,
 }
@@ -69,12 +76,23 @@ impl Bindings<'_> {
     pub fn norm(&self, w: &ReadOnly, x: (&BufferRef, usize), y: &BufferView, m: usize) {
         dispatch(
             self.encoder,
-            &self.base.pipelines.norm,
+            &self.kernels.pipelines.norm,
             &[x, w.binding(), y.binding()],
-            bytes_of(&self.base.norm),
+            bytes_of(&self.kernels.norm),
             [m, 1, 1],
             256,
         );
+    }
+
+    /// Normalize the stream for a layer's mixer, folding in the previous layer's feed-forward
+    /// output still waiting in `projected` unless this is the first layer.
+    pub fn enter_layer(&self, w: &ReadOnly, rows: usize, pending: bool) {
+        let s = self.scratch;
+        if pending {
+            self.add_norm(w, &s.projected, s.hidden.binding(), &s.norm, rows);
+        } else {
+            self.norm(w, s.hidden.binding(), &s.norm, rows);
+        }
     }
 
     /// Add a layer's contribution to the residual rows and normalize the result for the next
@@ -89,9 +107,9 @@ impl Bindings<'_> {
     ) {
         dispatch(
             self.encoder,
-            &self.base.pipelines.add_norm,
+            &self.kernels.pipelines.add_norm,
             &[hidden, residual.binding(), w.binding(), y.binding()],
-            bytes_of(&self.base.norm),
+            bytes_of(&self.kernels.norm),
             [rows, 1, 1],
             256,
         );
@@ -99,10 +117,10 @@ impl Bindings<'_> {
 
     /// Add a layer's contribution to the running features, preserving the residual path through layers.
     pub fn add(&self, residual: &BufferView, hidden: (&BufferRef, usize), rows: usize) {
-        let n = (rows * self.base.embedding.width) as u32;
+        let n = (rows * self.kernels.norm.n as usize) as u32;
         dispatch(
             self.encoder,
-            &self.base.pipelines.add,
+            &self.kernels.pipelines.add,
             &[hidden, residual.binding()],
             bytes_of(&n),
             [(n as usize).div_ceil(256), 1, 1],
@@ -111,12 +129,12 @@ impl Bindings<'_> {
     }
 
     /// Select the largest vocabulary score on the GPU for greedy decoding and direct token feedback.
-    pub fn argmax(&self) {
+    pub fn argmax(&self, vocabulary: usize) {
         dispatch(
             self.encoder,
-            &self.base.pipelines.argmax,
+            &self.kernels.pipelines.argmax,
             &[self.scratch.logits.at(0), self.scratch.next.at(0)],
-            bytes_of(&(self.base.output.vocabulary as u32)),
+            bytes_of(&(vocabulary as u32)),
             [1, 1, 1],
             1024,
         );

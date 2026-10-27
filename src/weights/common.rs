@@ -16,8 +16,15 @@ pub struct CommonWeights {
     pub embedding: Embedding,
     pub output: Output,
     pub output_norm: ReadOnly,
-    pub norm: compute::Norm,
+    pub kernels: Kernels,
+}
+
+/// Elementary kernels and the normalization policy shared by every operation on one
+/// residual stream; encoders own their own set alongside the language model's.
+pub struct Kernels {
     pub pipelines: ElementwisePipelines,
+    /// Stream width and RMS normalization parameters.
+    pub norm: compute::Norm,
 }
 
 /// One refinement of each token's representation: mix sequence history, then transform features.

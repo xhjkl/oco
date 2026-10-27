@@ -3,7 +3,7 @@ use crate::{
     tensor::{Tensor, WeightFormat},
     weights::{
         Architecture, Session,
-        common::CommonWeights,
+        common::{CommonWeights, Kernels},
         compute::{
             AttentionPlan, Norm, Rope,
             tests::{Gate, drain},
@@ -196,17 +196,20 @@ fn weights(output_coefficient: f32) -> Result<Architecture> {
             embedding,
             output,
             output_norm,
-            pipelines,
-            norm: Norm {
-                n: 64,
-                epsilon: 1e-5,
-                full_layer: 0,
+            kernels: Kernels {
+                pipelines,
+                norm: Norm {
+                    n: 64,
+                    epsilon: 1e-5,
+                    full_layer: 0,
+                },
             },
         },
         layers: Vec::new(),
         attention,
         gated,
         ffn_width: 64,
+        audio: None,
     };
     Ok(Architecture::QwenAttention(Arc::new(model)))
 }

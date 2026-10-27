@@ -76,7 +76,10 @@ impl Gpu {
             let descriptor = MTL4ComputePipelineDescriptor::new();
             descriptor.setComputeFunctionDescriptor(Some(&specialized));
             // Naming pipelines by symbol and specialization for the optional kernel profile.
-            let suffix: Vec<String> = constants.iter().map(|(_, value)| value.to_string()).collect();
+            let suffix: Vec<String> = constants
+                .iter()
+                .map(|(_, value)| value.to_string())
+                .collect();
             let label = NSString::from_str(&format!("{symbol}:{}", suffix.join("/")));
             descriptor.setLabel(Some(&label));
             let pipeline = compiler

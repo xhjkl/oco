@@ -88,12 +88,19 @@ struct Matrix {
     uint k, n, m, route_major, routes, experts, has_bias;
 };
 
+// IDs at or beyond the vocabulary (p.n) select precomputed BF16 feature rows instead
+// (audio features spliced into the token stream).
 kernel void embed(const device uchar *w [[buffer(0)]], const device uint *tokens [[buffer(1)]],
-                  device bfloat *out [[buffer(2)]], constant Matrix &p [[buffer(3)]],
-                  uint i [[thread_position_in_grid]]) {
+                  device bfloat *out [[buffer(2)]], const device bfloat *features [[buffer(3)]],
+                  constant Matrix &p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
     if (i >= p.m * p.k)
         return;
-    uint index = uint(tokens[i / p.k]) * p.k + i % p.k;
+    uint token = tokens[i / p.k];
+    if (token >= p.n) {
+        out[i] = features[(token - p.n) * p.k + i % p.k];
+        return;
+    }
+    uint index = token * p.k + i % p.k;
     // Copying native BF16 embeddings without decoding through float.
     if (weight_type == WeightFormat::Bf16)
         out[i] = reinterpret_cast<const device bfloat *>(w)[index];

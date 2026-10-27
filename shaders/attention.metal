@@ -38,7 +38,14 @@ struct AttentionParams {
     uint heads, kv_heads, dim, pos, window, sinks;
     float scale;
     uint m;
+    // Nonzero selects bidirectional attention over exactly this many stored keys (encoders and
+    // cross-attention); zero keeps causal attention through each query's own position.
+    uint keys;
 };
+// Exclusive end of the keys visible to the query at chunk row `t`.
+inline uint key_end(constant AttentionParams &p, uint t) {
+    return p.keys ? p.keys : p.pos + t + 1;
+}
 // Keys and values are retained as half so prefill can load them straight into SIMD-group matrices.
 // Online softmax and cross-SIMD reduction, with contiguous KV storage.
 [[kernel, max_total_threads_per_threadgroup(1024)]] void attention(const device bfloat *q [[buffer(0)]], const device half *k [[buffer(1)]],
@@ -57,7 +64,7 @@ struct AttentionParams {
     }
     float mx = p.sinks && sg == 0 ? float(bfloat(sinks[h])) : -INFINITY,
           sm = p.sinks && sg == 0 ? 1 : 0;
-    uint end = p.pos + t + 1, begin = p.window && end > p.window ? end - p.window : 0;
+    uint end = key_end(p, t), begin = p.window && end > p.window ? end - p.window : 0;
     for (uint s = begin + sg; s < end; s += 32) {
         float score = 0;
         for (uint j = 0; j < elems; j++)
@@ -86,65 +93,6 @@ struct AttentionParams {
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
-
-// Reducing complete output rows once; short key ranges need fewer cooperating SIMD groups.
-template <uint Groups>
-kernel void attention_compact(const device bfloat *q [[buffer(0)]],
-                              const device half *k [[buffer(1)]],
-                              const device half *v [[buffer(2)]],
-                              const device float *sinks [[buffer(3)]],
-                              device bfloat *out [[buffer(4)]], constant AttentionParams &p [[buffer(5)]],
-                              uint3 group [[threadgroup_position_in_grid]],
-                              uint tid [[thread_index_in_threadgroup]],
-                              uint lane [[thread_index_in_simdgroup]],
-                              uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float maxs[Groups], sums[Groups], outputs[Groups * 256];
-    uint h = group.x, t = group.y, kv = h / (p.heads / p.kv_heads), elems = p.dim / 32;
-    float qq[8], oo[8];
-    for (uint j = 0; j < elems; j++) {
-        qq[j] = float(q[(t * p.heads + h) * p.dim + lane * elems + j]) * p.scale;
-        oo[j] = 0;
-    }
-    // Keeping empty groups finite; their zero mass removes them from the reduction.
-    float mx = p.sinks && sg == 0 ? float(bfloat(sinks[h])) : -0x1.fffffep127f;
-    float sm = p.sinks && sg == 0 ? 1 : 0;
-    uint end = p.pos + t + 1, begin = p.window && end > p.window ? end - p.window : 0;
-    for (uint s = begin + sg; s < end; s += Groups) {
-        float score = 0;
-        for (uint j = 0; j < elems; j++)
-            score += qq[j] * float(k[(s * p.kv_heads + kv) * p.dim + lane * elems + j]);
-        score = simd_sum(score);
-        float nm = max(mx, score), f = fast::exp(mx - nm), e = fast::exp(score - nm);
-        sm = sm * f + e;
-        mx = nm;
-        for (uint j = 0; j < elems; j++)
-            oo[j] = oo[j] * f + e * float(v[(s * p.kv_heads + kv) * p.dim + lane * elems + j]);
-    }
-    if (lane == 0) {
-        maxs[sg] = mx;
-        sums[sg] = sm;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float local_max = lane < Groups ? maxs[lane] : -0x1.fffffep127f;
-    float mass = lane < Groups ? sums[lane] : 0;
-    float global = simd_max(local_max);
-    float den = simd_sum(mass * fast::exp(local_max - global));
-    float factor = fast::exp(mx - global);
-    for (uint j = 0; j < elems; j++)
-        outputs[(lane * elems + j) * Groups + sg] = oo[j] * factor;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint d = tid; d < p.dim; d += Groups * 32) {
-        float val = 0;
-#pragma unroll
-        for (uint g = 0; g < Groups; g++)
-            val += outputs[d * Groups + g];
-        out[(t * p.heads + h) * p.dim + d] = bfloat(val / den);
-    }
-}
-
-template [[host_name("attention_256")]] kernel void attention_compact<8>(
-    const device bfloat *, const device half *, const device half *, const device float *,
-    device bfloat *, constant AttentionParams &, uint3, uint, uint, uint);
 
 // Query-tiled attention for prompts: eight queries of one head per threadgroup and 32 keys per
 // step. Scores and weighted values use SIMD-group matrices with FP32 accumulation; the online
@@ -178,7 +126,7 @@ attention_tiled(const device bfloat *q [[buffer(0)]], const device half *k [[buf
         o[i] = simdgroup_float8x8(0);
     uint tiles = D / 32, dbase = sg * (D / 4);
     uint quad = lane / 4, lr = (quad & 4) + (lane / 2) % 4, lc = (quad & 2) * 2 + (lane % 2) * 2;
-    uint end = p.pos + min(t0 + 7, p.m - 1) + 1;
+    uint end = key_end(p, min(t0 + 7, p.m - 1));
     uint begin = p.window && p.pos + t0 + 1 > p.window ? p.pos + t0 + 1 - p.window : 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint kb = begin; kb < end; kb += 32) {
@@ -211,7 +159,7 @@ attention_tiled(const device bfloat *q [[buffer(0)]], const device half *k [[buf
             float scores[32];
             for (uint c = 0; c < 32; c++) {
                 uint key = kb + c;
-                bool valid = t < p.m && key <= qpos && key >= rbegin;
+                bool valid = t < p.m && key < key_end(p, t) && key >= rbegin;
                 scores[c] = valid ? ss[r * 32 + c] : -INFINITY;
                 peak = max(peak, scores[c]);
             }
@@ -267,16 +215,22 @@ attention_tiled(const device bfloat *q [[buffer(0)]], const device half *k [[buf
 }
 
 struct QkNorm {
-    uint dim, stride;
+    uint dim, q_stride, q_heads, k_heads;
     float epsilon;
 };
-kernel void qk_norm(device bfloat *x [[buffer(0)]], const device float *w [[buffer(1)]],
-                    constant QkNorm &p [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
-                    uint tid [[thread_index_in_threadgroup]],
-                    uint lane [[thread_index_in_simdgroup]],
-                    uint sg [[simdgroup_index_in_threadgroup]]) {
+// RMS-normalize every live query head, then every key head, one head per threadgroup.
+kernel void qk_norm_pair(device bfloat *q [[buffer(0)]], const device float *wq [[buffer(1)]],
+                         device bfloat *k [[buffer(2)]], const device float *wk [[buffer(3)]],
+                         constant QkNorm &p [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float sums[8];
-    uint offset = row * p.dim * p.stride;
+    bool query = group < p.q_heads;
+    uint row = query ? group : group - p.q_heads;
+    device bfloat *x = query ? q : k;
+    const device float *w = query ? wq : wk;
+    uint offset = row * p.dim * (query ? p.q_stride : 1);
     float val = tid < p.dim ? float(x[offset + tid]) : 0, s = simd_sum(val * val);
     if (lane == 0)
         sums[sg] = s;

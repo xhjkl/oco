@@ -1,4 +1,5 @@
 use super::GUARD;
+use crate::weights::compute::AttentionParams;
 use crate::{
     gpu::{
         BufferRef, Gpu, dispatch, dispatch_concurrent,
@@ -11,26 +12,12 @@ use crate::{
     },
 };
 use anyhow::Result;
-use bytemuck::{Pod, Zeroable};
 use half::{bf16, f16};
 
 #[path = "attention_split.rs"]
 mod split;
 #[path = "attention_wide.rs"]
 mod wide;
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct AttentionParams {
-    heads: u32,
-    kv_heads: u32,
-    dim: u32,
-    pos: u32,
-    window: u32,
-    sinks: u32,
-    scale: f32,
-    m: u32,
-}
 
 /// Preserve KV writes when only the last query is consumed or no query is consumed.
 #[test]

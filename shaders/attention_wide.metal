@@ -30,7 +30,7 @@ attention_wide16(const device bfloat *q [[buffer(0)]], const device half *k [[bu
     }
     uint tiles = D / 32, dbase = sg * (D / 4);
     uint quad = lane / 4, lr = (quad & 4) + (lane / 2) % 4, lc = (quad & 2) * 2 + (lane % 2) * 2;
-    uint end = p.pos + min(t0 + Rows - 1, p.m - 1) + 1;
+    uint end = key_end(p, min(t0 + Rows - 1, p.m - 1));
     uint begin = p.window && p.pos + t0 + 1 > p.window ? p.pos + t0 + 1 - p.window : 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint kb = begin; kb < end; kb += 32) {
@@ -72,7 +72,7 @@ attention_wide16(const device bfloat *q [[buffer(0)]], const device half *k [[bu
             float values[32];
             for (uint c = 0; c < 32; c++) {
                 uint key = kb + c;
-                bool valid = t < p.m && key <= qpos && key >= rbegin;
+                bool valid = t < p.m && key < key_end(p, t) && key >= rbegin;
                 values[c] = valid ? ss[r * 32 + c] : -INFINITY;
                 peak = max(peak, values[c]);
             }

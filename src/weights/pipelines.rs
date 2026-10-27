@@ -1,3 +1,4 @@
+use super::{common::Kernels, compute::Norm};
 use crate::gpu::Library;
 use crate::{
     gpu::{Gpu, Pipeline},
@@ -13,6 +14,8 @@ pub struct AttentionPipelines {
     pub dispatch: AttentionDispatch,
     pub tiled: Option<Pipeline>,
     pub wide: Option<Pipeline>,
+    /// 32-query register-softmax tiles for long batches of 64- or 128-wide heads.
+    pub block: Option<Pipeline>,
     pub split: Option<SplitAttentionPipelines>,
 }
 
@@ -22,19 +25,14 @@ pub struct SplitAttentionPipelines {
 }
 
 pub enum AttentionDispatch {
+    /// Several keys in flight per SIMD group, for 64-, 128-, and 256-wide heads.
+    Vector(Pipeline),
+    /// One SIMD group per key step, for other head widths.
     Plain(Pipeline),
-    Compact256(Pipeline),
-    Dim64 {
-        full: Pipeline,
-        compact_256: Pipeline,
-    },
-    Dim256 {
-        full: Pipeline,
-        compact_256: Pipeline,
-    },
 }
 
 pub struct GatedAttentionPipelines {
+    /// Normalizes every live query head and every key head in one launch.
     pub qk_norm: Pipeline,
     pub gate: Pipeline,
 }
@@ -64,6 +62,16 @@ pub struct NemotronPipelines {
     pub route_plan: Pipeline,
     pub expert_up: [Pipeline; 2],
     pub expert_down: [Pipeline; 2],
+}
+
+/// Kernels shared by the audio encoders and the Whisper decoder: mean-centered normalization,
+/// GELU, positional tables, and convolution unfolding.
+pub struct AudioPipelines {
+    pub layer_norm: Pipeline,
+    pub add_layer_norm: Pipeline,
+    pub gelu: Pipeline,
+    pub add_rows: Pipeline,
+    pub im2col: Pipeline,
 }
 
 pub struct ElementwisePipelines {
@@ -121,7 +129,11 @@ impl Builder {
     }
 
     /// Vector kernels specialized to square the positive part of their input on load.
-    pub(crate) fn get_relu_sqr(&mut self, symbol: &'static str, format: WeightFormat) -> Result<Pipeline> {
+    pub(crate) fn get_relu_sqr(
+        &mut self,
+        symbol: &'static str,
+        format: WeightFormat,
+    ) -> Result<Pipeline> {
         self.specialized(symbol, format, 0, true, false)
     }
 
@@ -134,7 +146,8 @@ impl Builder {
         f32_output: bool,
     ) -> Result<Pipeline> {
         // Folding the specialization flags above the row-tile range keeps one cache key.
-        let key = variant | if relu_sqr { 1 << 16 } else { 0 } | if f32_output { 1 << 17 } else { 0 };
+        let key =
+            variant | if relu_sqr { 1 << 16 } else { 0 } | if f32_output { 1 << 17 } else { 0 };
         if let Some(pipeline) = self.cache.get(&(symbol, format, key)) {
             return Ok(pipeline.clone());
         }
@@ -195,22 +208,39 @@ impl Builder {
         output: usize,
         f32_output: bool,
     ) -> Result<super::operands::Vector> {
+        self.vector_kernel(kind, output, false, f32_output)
+    }
+
+    /// Single-row kernel, optionally squaring the positive part of its input on load and
+    /// optionally storing FP32 results.
+    pub(crate) fn vector_kernel(
+        &mut self,
+        kind: WeightFormat,
+        output: usize,
+        relu_sqr: bool,
+        f32_output: bool,
+    ) -> Result<super::operands::Vector> {
         use WeightFormat::*;
         // Four-row SIMD groups: narrow outputs get small threadgroups so enough of them exist
         // to cover every GPU core; wide outputs amortize launch work over 32 rows.
         let threads = Self::vector_threads(output);
         let (symbol, column_groups) = match kind {
             Q4_0 | Q4_1 => ("matvec_q4", output.div_ceil(threads / 8)),
+            // Two rows per threadgroup with K split across SIMD groups keeps more loads in
+            // flight for Q8_0 than four rows per SIMD group.
+            Q8_0 => ("matvec_q8_split", output.div_ceil(2)),
             Q5K => ("matvec_q5k", output.div_ceil(16)),
             Q6K => ("matvec_q6k", output.div_ceil(16)),
-            F32 | F16 | Bf16 if output < 32768 => ("matvec_split", output),
+            // The one-row-per-threadgroup kernel does not apply the relu² load transform.
+            F32 | F16 | Bf16 if output < 32768 && !relu_sqr => ("matvec_split", output),
             _ => ("matvec", output.div_ceil(threads / 8)),
         };
         let threads = match symbol {
             "matvec" | "matvec_q4" => threads,
+            "matvec_q8_split" => 128,
             _ => 256,
         };
-        let pipeline = self.specialized(symbol, kind, 0, false, f32_output)?;
+        let pipeline = self.specialized(symbol, kind, 0, relu_sqr, f32_output)?;
         Ok(super::operands::Vector {
             pipeline,
             column_groups,
@@ -281,28 +311,28 @@ impl Builder {
         })
     }
 
+    /// Kernels for causal attention over up to `context` positions.
     pub fn attention(&mut self, dim: usize, context: usize) -> Result<AttentionPipelines> {
+        self.attention_with(dim, context, false)
+    }
+
+    /// Kernels for an encoder's bidirectional attention, which adds the 32-query block tiles.
+    pub fn encoder_attention(&mut self, dim: usize, context: usize) -> Result<AttentionPipelines> {
+        self.attention_with(dim, context, true)
+    }
+
+    fn attention_with(
+        &mut self,
+        dim: usize,
+        context: usize,
+        bidirectional: bool,
+    ) -> Result<AttentionPipelines> {
         use WeightFormat::F32;
         let rope = self.get("rope", F32, 0)?;
         let dispatch = match dim {
-            64 if context == 1 => {
-                let compact = self.get("attention_256", F32, 0)?;
-                AttentionDispatch::Compact256(compact)
-            }
-            256 if context <= 1024 => {
-                let compact = self.get("attention_256", F32, 0)?;
-                AttentionDispatch::Compact256(compact)
-            }
-            64 => {
-                let full = self.get("attention", F32, 0)?;
-                let compact_256 = self.get("attention_256", F32, 0)?;
-                AttentionDispatch::Dim64 { full, compact_256 }
-            }
-            256 => {
-                let full = self.get("attention", F32, 0)?;
-                let compact_256 = self.get("attention_256", F32, 0)?;
-                AttentionDispatch::Dim256 { full, compact_256 }
-            }
+            64 => AttentionDispatch::Vector(self.get("attention_vector_64", F32, 0)?),
+            128 => AttentionDispatch::Vector(self.get("attention_vector_128", F32, 0)?),
+            256 => AttentionDispatch::Vector(self.get("attention_vector_256", F32, 0)?),
             _ => AttentionDispatch::Plain(self.get("attention", F32, 0)?),
         };
         let tiled = if context >= 8 && dim <= 256 && dim.is_multiple_of(32) {
@@ -314,6 +344,13 @@ impl Builder {
             Some(self.get("attention_wide16", F32, 0)?)
         } else {
             None
+        };
+        let block = match dim {
+            64 if bidirectional && context >= 8 => Some(self.get("attention_block_64", F32, 0)?),
+            128 if bidirectional && context >= 8 => {
+                Some(self.get("attention_block_128", F32, 0)?)
+            }
+            _ => None,
         };
         let split = if context >= super::compute::AttentionPlan::SPLIT_MIN_KEYS
             && matches!(dim, 64 | 96 | 128 | 256)
@@ -330,13 +367,14 @@ impl Builder {
             dispatch,
             tiled,
             wide,
+            block,
             split,
         })
     }
 
     pub fn gated_attention(&mut self) -> Result<GatedAttentionPipelines> {
         use WeightFormat::F32;
-        let qk_norm = self.get("qk_norm", F32, 0)?;
+        let qk_norm = self.get("qk_norm_pair", F32, 0)?;
         let gate = self.get("attention_gate", F32, 0)?;
         Ok(GatedAttentionPipelines { qk_norm, gate })
     }
@@ -402,15 +440,27 @@ impl Builder {
         })
     }
 
-    /// Plain and relu²-input vector kernels for one dense weight encoding.
-    pub fn vector_pair(&mut self, kind: WeightFormat) -> Result<(Pipeline, Pipeline)> {
-        use WeightFormat::*;
-        let symbol = match kind {
-            Q4_0 | Q4_1 => "matvec_q4",
-            Q8_0 | F32 | F16 | Bf16 => "matvec",
-            _ => anyhow::bail!("unsupported shared expert encoding {kind:?}"),
-        };
-        Ok((self.get(symbol, kind, 0)?, self.get_relu_sqr(symbol, kind)?))
+    pub fn audio(&mut self) -> Result<AudioPipelines> {
+        use WeightFormat::F32;
+        Ok(AudioPipelines {
+            layer_norm: self.get("layer_norm", F32, 0)?,
+            add_layer_norm: self.get("add_layer_norm", F32, 0)?,
+            gelu: self.get("gelu", F32, 0)?,
+            add_rows: self.get("add_rows", F32, 0)?,
+            im2col: self.get("im2col", F32, 0)?,
+        })
+    }
+
+    /// Elementary kernels with the normalization policy of one `width`-wide residual stream.
+    pub fn kernels(&mut self, width: usize, epsilon: f32, full_layer: bool) -> Result<Kernels> {
+        Ok(Kernels {
+            pipelines: self.elementwise()?,
+            norm: Norm {
+                n: width as u32,
+                epsilon,
+                full_layer: full_layer as u32,
+            },
+        })
     }
 
     pub fn elementwise(&mut self) -> Result<ElementwisePipelines> {

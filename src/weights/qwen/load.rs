@@ -2,8 +2,9 @@
 mod selected;
 use super::delta::{CONV_TAPS, KEY_WIDTH};
 use super::{
-    DenseFfn, QwenLayer,
+    DenseFfn, Dialect, QwenLayer,
     attention::{GatedAttention, QwenAttention},
+    audio,
     delta::{Delta, QwenDelta},
     hybrid::{AttentionSlot, DeltaSlot, HybridMixer, QwenHybrid},
 };
@@ -12,7 +13,7 @@ use crate::{
     gpu::Gpu,
     weights::{
         Architecture,
-        common::{AttentionProjections, CommonWeights, Layer},
+        common::{AttentionProjections, CommonWeights, Kernels, Layer},
         compute::{AttentionPlan, DeltaPlan, Norm, Rope},
         load::{Geometry, Import, Parameters, Selection, common_selection, common_weights, import},
     },
@@ -25,11 +26,12 @@ impl<'a> Selection<'a> {
         &mut self,
         prefix: &str,
         g: &Geometry,
+        q_stride: usize,
     ) -> Result<selected::GatedAttention<'a>> {
         let q = self.projection_with_optional_bias(
             &format!("{prefix}.attn_q"),
             g.hidden,
-            g.heads * g.dim * 2,
+            g.heads * g.dim * q_stride,
         )?;
         let k = self.projection_with_optional_bias(
             &format!("{prefix}.attn_k"),
@@ -96,14 +98,14 @@ impl<'a> Selection<'a> {
     fn qwen_layers<M>(
         &mut self,
         g: &Geometry,
+        ffn_norm: &str,
         mut mixer: impl FnMut(&mut Self, usize, &str) -> Result<M>,
     ) -> Result<Vec<selected::QwenLayer<'a, M>>> {
         let mut layers = Vec::with_capacity(g.count);
         for index in 0..g.count {
             let prefix = format!("blk.{index}");
             let norm = self.float(&format!("{prefix}.attn_norm.weight"), &[g.hidden])?;
-            let post_norm =
-                self.float(&format!("{prefix}.post_attention_norm.weight"), &[g.hidden])?;
+            let post_norm = self.float(&format!("{prefix}.{ffn_norm}.weight"), &[g.hidden])?;
             let gate = self.projection_with_optional_bias(
                 &format!("{prefix}.ffn_gate"),
                 g.hidden,
@@ -228,15 +230,15 @@ impl Import {
     }
 }
 
-pub fn load(file: &Gguf, p: &Parameters<'_>, mut g: Geometry) -> Result<Architecture> {
-    p.scaling("none")?;
-    let factor = p.optional("rope.scaling.factor", 1.0)?;
-    ensure!(factor == 1.0, "unsupported Qwen RoPE scaling factor");
-    let rope_dim = p.integer("rope.dimension_count")?;
-    ensure!(
-        rope_dim <= g.dim && rope_dim.is_multiple_of(2),
-        "invalid RoPE dimensions"
-    );
+/// Gated delta geometry shared by Qwen3.5's recurrent layers; absent from dense Qwen3.
+struct DeltaGeometry {
+    kh: usize,
+    vh: usize,
+    vd: usize,
+    interval: usize,
+}
+
+fn delta_geometry(p: &Parameters<'_>) -> Result<DeltaGeometry> {
     let kh = p.integer("ssm.group_count")?;
     let vh = p.integer("ssm.time_step_rank")?;
     let inner = p.integer("ssm.inner_size")?;
@@ -254,6 +256,38 @@ pub fn load(file: &Gguf, p: &Parameters<'_>, mut g: Geometry) -> Result<Architec
         "unsupported gated delta geometry"
     );
     let interval = p.integer("full_attention_interval")?;
+    Ok(DeltaGeometry {
+        kh,
+        vh,
+        vd,
+        interval,
+    })
+}
+
+pub fn load(
+    file: &Gguf,
+    p: &Parameters<'_>,
+    mut g: Geometry,
+    dialect: Dialect,
+    audio: Option<&Gguf>,
+) -> Result<Architecture> {
+    p.scaling("none")?;
+    let factor = p.optional("rope.scaling.factor", 1.0)?;
+    ensure!(factor == 1.0, "unsupported Qwen RoPE scaling factor");
+    let (rope_dim, q_stride, ffn_norm) = match dialect {
+        Dialect::Qwen35 => (p.integer("rope.dimension_count")?, 2, "post_attention_norm"),
+        Dialect::Qwen3 => (g.dim, 1, "ffn_norm"),
+    };
+    ensure!(
+        rope_dim <= g.dim && rope_dim.is_multiple_of(2),
+        "invalid RoPE dimensions"
+    );
+    let delta = match dialect {
+        Dialect::Qwen35 => Some(delta_geometry(p)?),
+        Dialect::Qwen3 => None,
+    };
+    // Dense Qwen3 has no recurrent layers: every block attends.
+    let interval = delta.as_ref().map_or(1, |d| d.interval);
     let mtp = file
         .optional_unsigned("qwen35.nextn_predict_layers")?
         .unwrap_or(0);
@@ -269,7 +303,7 @@ pub fn load(file: &Gguf, p: &Parameters<'_>, mut g: Geometry) -> Result<Architec
         rope_dim: rope_dim as u32,
         m: 0,
         pos: 0,
-        q_stride: 2,
+        q_stride: q_stride as u32,
         base: g.base,
         factor: 1.0,
         low: 0.0,
@@ -279,22 +313,32 @@ pub fn load(file: &Gguf, p: &Parameters<'_>, mut g: Geometry) -> Result<Architec
     let directory = file.directory()?;
     let (mut s, common) = common_selection(&directory, &g)?;
     let selected = if delta_count == 0 {
-        let layers = s.qwen_layers(&g, |s, _, prefix| s.gated_attention(prefix, &g))?;
+        let layers = s.qwen_layers(&g, ffn_norm, |s, _, prefix| {
+            s.gated_attention(prefix, &g, q_stride)
+        })?;
         selected::Qwen::Attention(layers)
     } else if attention_count == 0 {
-        let layers = s.qwen_layers(&g, |s, _, prefix| s.delta(prefix, g.hidden, kh, vh, vd))?;
+        let d = delta
+            .as_ref()
+            .context("gated delta layers need their geometry")?;
+        let layers = s.qwen_layers(&g, ffn_norm, |s, _, prefix| {
+            s.delta(prefix, g.hidden, d.kh, d.vh, d.vd)
+        })?;
         selected::Qwen::Delta(layers)
     } else {
+        let d = delta
+            .as_ref()
+            .context("gated delta layers need their geometry")?;
         let mut attention_layers = 0;
         let mut delta_layers = 0;
-        let layers = s.qwen_layers(&g, |s, index, prefix| {
+        let layers = s.qwen_layers(&g, ffn_norm, |s, index, prefix| {
             let mixer = if (index + 1) % interval == 0 {
-                let weights = s.gated_attention(prefix, &g)?;
+                let weights = s.gated_attention(prefix, &g, q_stride)?;
                 let slot = AttentionSlot(attention_layers);
                 attention_layers += 1;
                 selected::Mixer::Attention { weights, slot }
             } else {
-                let weights = s.delta(prefix, g.hidden, kh, vh, vd)?;
+                let weights = s.delta(prefix, g.hidden, d.kh, d.vh, d.vd)?;
                 let slot = DeltaSlot(delta_layers);
                 delta_layers += 1;
                 selected::Mixer::Delta { weights, slot }
@@ -322,9 +366,12 @@ pub fn load(file: &Gguf, p: &Parameters<'_>, mut g: Geometry) -> Result<Architec
         embedding,
         output,
         output_norm,
-        norm,
-        pipelines,
+        kernels: Kernels { pipelines, norm },
     };
+    ensure!(
+        audio.is_none() || matches!(selected, selected::Qwen::Attention(_)),
+        "audio encoders attach only to dense attention models"
+    );
     let inner = match selected {
         selected::Qwen::Attention(layers) => {
             let attention = i.builder.attention(g.dim, g.context)?;
@@ -332,6 +379,10 @@ pub fn load(file: &Gguf, p: &Parameters<'_>, mut g: Geometry) -> Result<Architec
             let gated = i.builder.gated_attention()?;
             let layers = i.qwen_layers(layers, |i, weights| i.gated_attention(weights))?;
             let residency = i.finish()?;
+            let audio = match audio {
+                None => None,
+                Some(file) => Some(audio::load(file, &gpu, g.hidden)?),
+            };
             let base = base(gpu, residency);
             let weights = QwenAttention {
                 base,
@@ -339,12 +390,16 @@ pub fn load(file: &Gguf, p: &Parameters<'_>, mut g: Geometry) -> Result<Architec
                 attention,
                 gated,
                 ffn_width: g.ffn_width,
+                audio,
             };
             Architecture::QwenAttention(Arc::new(weights))
         }
         selected::Qwen::Delta(layers) => {
             let recurrent = i.builder.recurrent()?;
-            let delta = DeltaPlan::new(kh, vh, vd, g.epsilon, recurrent);
+            let d = delta
+                .as_ref()
+                .context("gated delta layers need their geometry")?;
+            let delta = DeltaPlan::new(d.kh, d.vh, d.vd, g.epsilon, recurrent);
             let layers = i.qwen_layers(layers, |i, weights| i.delta(weights))?;
             let residency = i.finish()?;
             let base = base(gpu, residency);
@@ -362,7 +417,10 @@ pub fn load(file: &Gguf, p: &Parameters<'_>, mut g: Geometry) -> Result<Architec
             delta_layers,
         } => {
             let recurrent = i.builder.recurrent()?;
-            let delta = DeltaPlan::new(kh, vh, vd, g.epsilon, recurrent);
+            let d = delta
+                .as_ref()
+                .context("gated delta layers need their geometry")?;
+            let delta = DeltaPlan::new(d.kh, d.vh, d.vd, g.epsilon, recurrent);
             let attention = i.builder.attention(g.dim, g.context)?;
             let attention = AttentionPlan::new(rope, attention);
             let gated = i.builder.gated_attention()?;

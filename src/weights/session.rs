@@ -1,6 +1,6 @@
 use super::*;
 use crate::gpu::BufferView;
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use compute::{Bindings, Compute};
 use state::*;
 use std::ops::Range;
@@ -15,6 +15,8 @@ pub struct Session {
     progress: Progress,
     pub(super) capacity: usize,
     prefill_rows: usize,
+    /// Audio feature rows filled so far; IDs `vocabulary..vocabulary + features` select them.
+    pub(super) features: usize,
 }
 
 /// Host access permission for mutable GPU state, restored only after a validated completion.
@@ -101,7 +103,52 @@ impl Session {
             progress: Progress::Empty,
             capacity,
             prefill_rows,
+            features: 0,
         })
+    }
+
+    /// Encode 16 kHz mono audio into feature rows the next prompt can reference.
+    ///
+    /// Returns one ID per audio token, each at or beyond the vocabulary; splice them into
+    /// the prompt between the checkpoint's audio markers. Rows accumulate until [`Self::reset`]
+    /// and count against the session capacity. Requires a model loaded with [`crate::load_asr`].
+    pub async fn embed_audio(&mut self, samples: &[f32]) -> Result<Vec<u32>> {
+        self.position()?;
+        let Execution::QwenAttention { weights, memory } = &self.inner else {
+            bail!("this model has no audio encoder");
+        };
+        let (Some(encoder), Some((scratch, features))) = (&weights.audio, &memory.audio) else {
+            bail!("this model has no audio encoder");
+        };
+        let windows = encoder.windows(samples)?;
+        let total: usize = windows.iter().map(qwen::audio::Window::tokens).sum();
+        let mut used = self.features;
+        ensure!(
+            total <= self.capacity - used,
+            "audio exceeds the session capacity"
+        );
+        let vocabulary = self.vocabulary_size();
+        let width = encoder.output * 2;
+        let mut ids = Vec::with_capacity(total);
+        for window in &windows {
+            scratch.mel.write(0, &window.mel);
+            let rows = window.tokens();
+            let destination = features.slice(used * width, rows * width);
+            let submission = self.compute.submit(|commands| {
+                let compute = Bindings {
+                    kernels: &encoder.kernels,
+                    scratch: &scratch.common,
+                    encoder: commands,
+                };
+                encoder.encode(&compute, scratch, window.chunks, &destination);
+            });
+            // Partial encodings are harmless: unreferenced rows are never read.
+            submission.await?;
+            ids.extend((used..used + rows).map(|row| (vocabulary + row) as u32));
+            used += rows;
+        }
+        self.features = used;
+        Ok(ids)
     }
 
     fn common(&self) -> (&CommonWeights, &CommonScratch) {
@@ -190,6 +237,7 @@ impl Session {
             state.reset();
         }
         self.progress = Progress::Empty;
+        self.features = 0;
         Ok(())
     }
 
@@ -202,13 +250,21 @@ impl Session {
         output_row: Option<usize>,
     ) -> Result<()> {
         let (base, scratch) = self.common();
+        let features = match &self.inner {
+            Execution::QwenAttention { memory, .. } => memory
+                .audio
+                .as_ref()
+                .map(|(_, features)| features.binding()),
+            _ => None,
+        };
         let submission = self.compute.submit(|encoder| {
             let compute = Bindings {
-                base,
+                kernels: &base.kernels,
                 scratch,
                 encoder,
             };
-            compute.embed(input, positions.len());
+            let features = features.unwrap_or(scratch.next.binding());
+            compute.embed(&base.embedding, input, positions.len(), features);
             with_architecture!(&self.inner, Execution { weights, memory } =>
                 weights.encode_layers(&compute, memory, positions, output_row)
             );
@@ -220,8 +276,8 @@ impl Session {
                     &scratch.norm,
                     1,
                 );
-                compute.output();
-                compute.argmax();
+                compute.output(&base.output);
+                compute.argmax(base.output.vocabulary);
             }
         });
         submission.await

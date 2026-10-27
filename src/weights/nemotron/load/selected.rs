@@ -27,7 +27,10 @@ pub(super) struct Experts<'a> {
 }
 
 pub(super) enum Mixer<'a> {
-    Mamba { weights: Mamba<'a>, slot: usize },
+    Mamba {
+        weights: Mamba<'a>,
+        slot: usize,
+    },
     Attention {
         weights: AttentionProjections<Dense<'a>>,
         slot: usize,

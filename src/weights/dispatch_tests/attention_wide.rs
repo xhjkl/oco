@@ -30,10 +30,20 @@ fn attention_matches_independent_reference_and_cache_tails() -> Result<()> {
             128,
         ),
         (64, 8, 2, 129, 512, 128, true, "attention_wide16", 16, 128),
+        (64, 8, 2, 129, 512, 128, true, "attention_block_64", 32, 128),
+        (128, 8, 2, 31, 77, 0, false, "attention_block_128", 32, 128),
+        (64, 8, 2, 127, 9, 128, true, "attention_block_64", 32, 128),
         (256, 4, 2, 31, 9, 0, false, "attention_tiled", 8, 128),
         (64, 8, 2, 127, 9, 128, true, "attention_tiled", 8, 128),
         (64, 8, 2, 129, 1, 0, true, "attention", 1, 1024),
-        (256, 4, 2, 7, 3, 0, false, "attention_256", 1, 256),
+        (64, 8, 2, 129, 1, 0, true, "attention_vector_64", 1, 256),
+        (64, 8, 2, 1000, 3, 128, false, "attention_vector_64", 1, 256),
+        (128, 8, 4, 517, 1, 0, false, "attention_vector_128", 1, 256),
+        (128, 32, 2, 517, 1, 0, false, "attention_vector_128", 1, 256),
+        (128, 32, 2, 0, 1, 0, false, "attention_vector_128", 1, 256),
+        (128, 32, 2, 16, 7, 0, false, "attention_vector_128", 1, 256),
+        (128, 8, 4, 5, 2, 0, true, "attention_vector_128", 1, 256),
+        (256, 4, 2, 700, 1, 0, false, "attention_vector_256", 1, 256),
     ] {
         let pipeline = builder.get(symbol, WeightFormat::F32, 0)?;
         let count = rows * heads * dim;
@@ -66,6 +76,7 @@ fn attention_matches_independent_reference_and_cache_tails() -> Result<()> {
             sinks: u32::from(has_sinks),
             scale: 1.0 / (dim as f32).sqrt(),
             m: rows as u32,
+            keys: 0,
         };
         let submission = compute.submit(|encoder| {
             dispatch(

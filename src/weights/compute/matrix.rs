@@ -50,7 +50,7 @@ impl DenseMatrix {
         };
         dispatch(
             compute.encoder,
-            &compute.base.pipelines.q4_input_scales,
+            &compute.kernels.pipelines.q4_input_scales,
             &[x, scales],
             bytes_of(&p),
             [selected.len(), 1, 1],
@@ -173,7 +173,14 @@ impl DenseMatrix {
             } => {
                 if m <= *vector_rows {
                     let groups = [vector.column_groups, m, 1];
-                    first(e, &vector.pipeline, &buffers, bytes_of(&p), groups, vector.threads);
+                    first(
+                        e,
+                        &vector.pipeline,
+                        &buffers,
+                        bytes_of(&p),
+                        groups,
+                        vector.threads,
+                    );
                     return;
                 }
                 (narrow, wide)
@@ -239,7 +246,7 @@ impl Projection {
     }
 
     /// Project an intermediate, preparing transient gains only when its tiled plan needs them.
-    pub(super) fn apply(
+    pub(crate) fn apply(
         &self,
         compute: &Bindings<'_>,
         x: (&BufferRef, usize),
@@ -319,11 +326,17 @@ impl Bindings<'_> {
     }
 
     /// Look up the learned feature vector for each supplied token before the first layer.
-    pub fn embed(&self, input: &BufferView, rows: usize) {
-        let w = &self.base.embedding;
+    /// IDs at or beyond the vocabulary copy the corresponding precomputed `features` row instead.
+    pub fn embed(
+        &self,
+        w: &Embedding,
+        input: &BufferView,
+        rows: usize,
+        features: (&BufferRef, usize),
+    ) {
         let p = Matrix {
             k: w.width as u32,
-            n: 0,
+            n: w.vocabulary as u32,
             m: rows as u32,
             route_major: 0,
             routes: 0,
@@ -337,6 +350,7 @@ impl Bindings<'_> {
                 w.values.binding(),
                 input.binding(),
                 self.scratch.hidden.at(0),
+                features,
             ],
             bytes_of(&p),
             [(rows * w.width).div_ceil(256), 1, 1],
@@ -345,8 +359,7 @@ impl Bindings<'_> {
     }
 
     /// Score every vocabulary token as a possible successor to the final input row.
-    pub fn output(&self) {
-        let w = &self.base.output;
+    pub fn output(&self, w: &Output) {
         let p = Matrix {
             k: w.width as u32,
             n: w.vocabulary as u32,

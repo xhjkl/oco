@@ -1,4 +1,6 @@
 mod attention;
+mod audio;
+mod dense_bench;
 mod matrix_precision;
 mod mxfp4;
 mod nemotron;

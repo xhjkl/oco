@@ -3,7 +3,7 @@
 struct SplitAttentionParams {
     uint heads, kv_heads, dim, pos, window, sinks;
     float scale;
-    uint m, splits;
+    uint m, keys, splits;
 };
 
 [[kernel, max_total_threads_per_threadgroup(128)]] void
@@ -20,7 +20,7 @@ attention_gqa_split(const device bfloat *q [[buffer(0)]], const device half *k [
     uint kv = group.x / head_tiles, first_head = kv * ratio + (group.x % head_tiles) * 8;
     uint head_end = (kv + 1) * ratio, t = group.y, part = group.z, D = p.dim;
     uint kstride = p.kv_heads * D;
-    uint end = p.pos + t + 1;
+    uint end = p.keys ? p.keys : p.pos + t + 1;
     uint begin = p.window && end > p.window ? end - p.window : 0;
     uint active = end - begin;
     uint span = active / p.splits, extra = active % p.splits;

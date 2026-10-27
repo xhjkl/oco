@@ -6,7 +6,9 @@ use std::time::Instant;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let path = args.next().context("usage: bench MODEL.gguf [PROMPT] [GENERATED] [REPEATS]")?;
+    let path = args
+        .next()
+        .context("usage: bench MODEL.gguf [PROMPT] [GENERATED] [REPEATS]")?;
     let prompt_tokens: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(512);
     let generated: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(128);
     let repeats: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(3);
@@ -42,13 +44,20 @@ async fn main() -> Result<()> {
         }
         let decode = begin.elapsed();
         if let Some(report) = oco::profile_report() {
-            eprintln!("--- decode kernels (run {repeat}, {} steps)\n{report}", generated - 1);
+            eprintln!(
+                "--- decode kernels (run {repeat}, {} steps)\n{report}",
+                generated - 1
+            );
         }
         let pp = prompt_tokens as f64 / prefill.as_secs_f64();
         let tg = (generated - 1) as f64 / decode.as_secs_f64();
         eprintln!(
             "run {repeat}: pp{prompt_tokens} {pp:8.2} t/s ({prefill:.3?})  tg{generated} {tg:7.2} t/s ({decode:.3?}){}",
-            if distinct { "" } else { "  [degenerate output]" }
+            if distinct {
+                ""
+            } else {
+                "  [degenerate output]"
+            }
         );
         prefill_rates.push(pp);
         decode_rates.push(tg);

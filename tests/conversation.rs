@@ -50,7 +50,9 @@ fn converse(variable: &str) -> Result<()> {
         answer.text.trim()
     );
     assert!(
-        final_text(family, &answer.text).to_lowercase().contains("paris"),
+        final_text(family, &answer.text)
+            .to_lowercase()
+            .contains("paris"),
         "expected Paris in {:?}",
         answer.text
     );
@@ -83,8 +85,14 @@ fn converse(variable: &str) -> Result<()> {
                 text.contains("<function=get_weather>"),
                 "wrong function in {text:?}"
             );
-            assert!(text.contains("<parameter=city>"), "no city parameter in {text:?}");
-            assert!(text.contains("</function>"), "unterminated call in {text:?}");
+            assert!(
+                text.contains("<parameter=city>"),
+                "no city parameter in {text:?}"
+            );
+            assert!(
+                text.contains("</function>"),
+                "unterminated call in {text:?}"
+            );
             let last = call.tokens.last().copied();
             assert_eq!(
                 last,
@@ -113,16 +121,8 @@ fn converse(variable: &str) -> Result<()> {
 /// Strip reasoning and channel preambles so the assertion reads the user-visible answer.
 fn final_text(family: Family, text: &str) -> String {
     match family {
-        Family::GptOss => text
-            .rsplit("<|message|>")
-            .next()
-            .unwrap_or(text)
-            .to_owned(),
-        Family::Nemotron => text
-            .rsplit("</think>")
-            .next()
-            .unwrap_or(text)
-            .to_owned(),
+        Family::GptOss => text.rsplit("<|message|>").next().unwrap_or(text).to_owned(),
+        Family::Nemotron => text.rsplit("</think>").next().unwrap_or(text).to_owned(),
         Family::Qwen => text.to_owned(),
     }
 }

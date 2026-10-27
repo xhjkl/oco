@@ -12,7 +12,7 @@ macro_rules! with_architecture {
     };
 }
 
-mod common;
+pub(crate) mod common;
 pub(crate) mod compute;
 #[cfg(test)]
 mod dispatch_tests;
@@ -20,8 +20,8 @@ pub(crate) mod generation;
 mod gpt_oss;
 mod load;
 mod nemotron;
-mod operands;
-mod pipelines;
+pub(crate) mod operands;
+pub(crate) mod pipelines;
 mod qwen;
 pub(crate) mod session;
 pub(crate) mod state;
@@ -31,6 +31,7 @@ use anyhow::Result;
 use common::CommonWeights;
 pub use generation::Inference;
 pub(crate) use load::{METADATA, load};
+pub(crate) use qwen::audio::METADATA as AUDIO_METADATA;
 pub use session::Session;
 use std::sync::Arc;
 

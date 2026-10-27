@@ -388,7 +388,6 @@ expert_q4_staged(const device uchar *w [[buffer(0)]], const device bfloat *x [[b
     if (tile_row >= count)
         return;
     uint n0 = group.x * BN, blocks = p.k / 32;
-    uint quad = lane / 4, lr = (quad & 4) + (lane / 2) % 4, lc = (quad & 2) * 2 + (lane % 2) * 2;
     // Weights: two threads per row, one nibble half (sixteen k values) each.
     uint wn = tid / 2, wb = tid % 2;
     const device uchar *row_blocks = w + (expert * p.n + min(n0 + wn, p.n - 1)) * blocks * 18;

@@ -86,7 +86,7 @@ impl Bindings<'_> {
         // Overwriting each consumed gate element after reading it.
         dispatch(
             self.encoder,
-            &self.base.pipelines.gate,
+            &self.kernels.pipelines.gate,
             &[
                 self.scratch.gate.at(0),
                 self.scratch.up.at(0),
@@ -99,20 +99,15 @@ impl Bindings<'_> {
     }
 
     /// Refine each token's features independently, using a learned gate before projecting back.
-    pub fn feed_forward(
-        &self,
-        w: &DenseFfn,
-        ffn_width: usize,
-        hidden: (&BufferRef, usize),
-        rows: usize,
-    ) {
+    /// The result waits in `projected`; the caller adds it to the residual stream, usually
+    /// fused with the next layer's normalization.
+    pub fn feed_forward(&self, w: &DenseFfn, ffn_width: usize, rows: usize) {
         let s = self.scratch;
         self.prepare_norm_scales(&[&w.gate.matrix, &w.up.matrix], rows, 0..rows);
         w.gate.apply_norm(self, &s.gate, rows);
         w.up.apply_norm_concurrent(self, &s.up, rows);
         self.activate(rows * ffn_width, false);
         w.down.apply(self, s.gate.at(0), &s.projected, rows);
-        self.add(&s.projected, hidden, rows);
     }
 
     /// Route each token to four experts and add their weighted contributions to its features.

@@ -44,9 +44,10 @@ impl Session {
             tokens.len() <= self.capacity - position,
             "context capacity exceeded"
         );
-        let vocabulary = self.vocabulary_size();
+        // IDs past the vocabulary select audio feature rows already encoded into this session.
+        let limit = self.vocabulary_size() + self.features;
         ensure!(
-            tokens.iter().all(|&t| (t as usize) < vocabulary),
+            tokens.iter().all(|&t| (t as usize) < limit),
             "token outside vocabulary"
         );
         Ok(Inference {

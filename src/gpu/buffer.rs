@@ -44,6 +44,17 @@ impl BufferView {
         (&self.buffer, self.offset + offset)
     }
 
+    /// Narrow this view to a byte range within it.
+    pub fn slice(&self, offset: usize, length: usize) -> BufferView {
+        assert!(offset <= self.length && length <= self.length - offset);
+        BufferView {
+            buffer: self.buffer.clone(),
+            pointer: self.pointer + offset,
+            offset: self.offset + offset,
+            length,
+        }
+    }
+
     pub fn read<T: Pod>(&self, values: &mut [T]) {
         let bytes = bytemuck::cast_slice_mut(values);
         assert!(bytes.len() <= self.length, "read exceeds storage range");
@@ -85,6 +96,17 @@ pub struct ReadOnly {
 }
 
 impl ReadOnly {
+    /// View a byte range of an allocation the caller filled before any GPU use and will not
+    /// write again; shaders must not write to it either.
+    pub fn within(buffer: &Buffer, offset: usize, length: usize) -> Self {
+        assert!(offset <= buffer.length() && length <= buffer.length() - offset);
+        Self {
+            buffer: buffer.clone(),
+            offset,
+            length,
+        }
+    }
+
     pub fn binding(&self) -> (&BufferRef, usize) {
         (&self.buffer, self.offset)
     }
@@ -177,6 +199,18 @@ fn page_size() -> Result<usize> {
 }
 
 impl Gpu {
+    /// Copy host bytes into a new shared allocation and expose it as immutable weights.
+    /// Used for operands repacked at load time, such as padded convolution kernels.
+    pub fn upload(&self, bytes: &[u8]) -> ReadOnly {
+        let buffer = self.new_buffer(bytes.len());
+        BufferView::new(&buffer, 0, bytes.len()).write(0, bytes);
+        ReadOnly {
+            buffer,
+            offset: 0,
+            length: bytes.len(),
+        }
+    }
+
     pub fn new_buffer(&self, bytes: usize) -> Buffer {
         let buffer = self
             .device

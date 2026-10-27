@@ -145,12 +145,14 @@ fn check_decode_reference(
         for row in 0..n {
             let offset = (expert as usize * n + row) * k;
             let up_bias = bf16::from_f32(bias[expert as usize * n + row] + 1.0).to_f64();
-            let up_reference = reference_dot(&coefficients[offset..offset + k], &bf_values, up_bias);
+            let up_reference =
+                reference_dot(&coefficients[offset..offset + k], &bf_values, up_bias);
             let actual_up = f64::from(f32::from_bits(up[GUARD + route * n + row]));
             check_roundoff(actual_up, up_reference, k, false, route, row);
             // The gate slot holds the clipped SwiGLU of (gate, up) computed from exact sums.
             let gate_bias = bf16::from_f32(bias[expert as usize * n + row]).to_f64();
-            let (gate_sum, _) = reference_dot(&coefficients[offset..offset + k], &bf_values, gate_bias);
+            let (gate_sum, _) =
+                reference_dot(&coefficients[offset..offset + k], &bf_values, gate_bias);
             let g = gate_sum.min(7.0);
             let u = up_reference.0.clamp(-6.0, 8.0);
             let expected = g / (1.0 + (-1.702 * g).exp()) * u;

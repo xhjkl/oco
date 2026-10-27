@@ -1,6 +1,6 @@
 use super::Bindings;
 use crate::{
-    gpu::{ReadOnly, dispatch, dispatch_concurrent},
+    gpu::{BufferRef, ReadOnly, dispatch, dispatch_concurrent},
     weights::{
         common::AttentionProjections,
         gpt_oss::SinkAttention,
@@ -31,17 +31,56 @@ pub struct Rope {
     pub scale: f32,
 }
 
+impl Rope {
+    /// Geometry for attention without positional rotation (encoders, cross-attention, NoPE).
+    pub fn unrotated(heads: usize, kv_heads: usize, dim: usize) -> Self {
+        Self {
+            heads: heads as u32,
+            kv_heads: kv_heads as u32,
+            dim: dim as u32,
+            rope_dim: 0,
+            m: 0,
+            pos: 0,
+            q_stride: 1,
+            base: 10000.0,
+            factor: 1.0,
+            low: 0.0,
+            high: 1.0,
+            scale: 1.0,
+        }
+    }
+}
+
+/// Per-dispatch attention geometry shared with the kernels (and reused by their tests).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct AttentionParams {
-    heads: u32,
-    kv_heads: u32,
-    dim: u32,
-    pos: u32,
-    window: u32,
-    sinks: u32,
-    scale: f32,
-    m: u32,
+pub(crate) struct AttentionParams {
+    pub heads: u32,
+    pub kv_heads: u32,
+    pub dim: u32,
+    pub pos: u32,
+    pub window: u32,
+    pub sinks: u32,
+    pub scale: f32,
+    pub m: u32,
+    /// Nonzero attends every query to exactly this many stored keys; zero is causal.
+    pub keys: u32,
+}
+
+impl AttentionParams {
+    fn new(plan: &AttentionPlan, pos: usize, m: usize, keys: usize) -> Self {
+        Self {
+            heads: plan.rope.heads,
+            kv_heads: plan.rope.kv_heads,
+            dim: plan.rope.dim,
+            pos: pos as u32,
+            window: 0,
+            sinks: 0,
+            scale: plan.scale,
+            m: m as u32,
+            keys: keys as u32,
+        }
+    }
 }
 
 #[repr(C)]
@@ -55,7 +94,10 @@ struct SplitAttentionParams {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct QkNorm {
     dim: u32,
-    stride: u32,
+    /// Query head stride in head widths: 2 interleaves a gate after each query head.
+    q_stride: u32,
+    q_heads: u32,
+    k_heads: u32,
     epsilon: f32,
 }
 
@@ -103,20 +145,11 @@ impl AttentionPlan {
 }
 
 impl AttentionDispatch {
-    /// Select the fallback kernel after wide and tiled prefill have been handled.
-    /// D64/D256 reach this path only with fewer than eight output rows.
-    pub fn select(&self, rows: usize, keys: usize) -> (&crate::gpu::Pipeline, usize) {
+    /// Kernel and threadgroup size for batches too short for the tiled kernels.
+    pub fn select(&self) -> (&crate::gpu::Pipeline, usize) {
         match self {
-            Self::Plain(full) => (full, 1024),
-            Self::Compact256(p) => (p, 256),
-            Self::Dim64 { compact_256, .. } if rows == 1 && keys <= 128 => (compact_256, 256),
-            Self::Dim64 { full, .. } => (full, 1024),
-            Self::Dim256 { compact_256, .. }
-                if (rows == 1 && keys <= 2048) || ((2..=7).contains(&rows) && keys <= 1024) =>
-            {
-                (compact_256, 256)
-            }
-            Self::Dim256 { full, .. } => (full, 1024),
+            Self::Vector(p) => (p, 256),
+            Self::Plain(p) => (p, 1024),
         }
     }
 }
@@ -182,47 +215,43 @@ impl Bindings<'_> {
         let m = positions.len();
         let e = self.encoder;
         self.project_qkv(w, s, m, output.clone());
-        let mut p = QkNorm {
+        // Gated layouts interleave each head's gate after its query; plain Qwen3 queries are packed.
+        let q_heads = output.len() * plan.rope.heads as usize;
+        let k_heads = m * plan.rope.kv_heads as usize;
+        let p = QkNorm {
             dim: plan.rope.dim,
-            stride: 2,
-            epsilon: self.base.norm.epsilon,
+            q_stride: plan.rope.q_stride,
+            q_heads: q_heads as u32,
+            k_heads: k_heads as u32,
+            epsilon: self.kernels.norm.epsilon,
         };
-        if !output.is_empty() {
-            dispatch(
-                e,
-                &gated.qk_norm,
-                &[s.q.at(0), a.qnorm.binding()],
-                bytes_of(&p),
-                [output.len() * plan.rope.heads as usize, 1, 1],
-                256,
-            );
-        }
-        p.stride = 1;
         dispatch(
             e,
             &gated.qk_norm,
-            &[s.k.at(0), a.knorm.binding()],
+            &[s.q.at(0), a.qnorm.binding(), s.k.at(0), a.knorm.binding()],
             bytes_of(&p),
-            [m * plan.rope.kv_heads as usize, 1, 1],
+            [q_heads + k_heads, 1, 1],
             256,
         );
         self.attention(plan, (s, state), None, 0, positions, output.clone());
         if output.is_empty() {
             return;
         }
-        let n = output.len() * plan.output_width;
-        let p = AttentionGateParams {
-            n: n as u32,
-            dim: plan.rope.dim,
-        };
-        dispatch(
-            e,
-            &gated.gate,
-            &[s.mixed.at(0), s.q.at(0)],
-            bytes_of(&p),
-            [n.div_ceil(256), 1, 1],
-            256,
-        );
+        if plan.rope.q_stride == 2 {
+            let n = output.len() * plan.output_width;
+            let p = AttentionGateParams {
+                n: n as u32,
+                dim: plan.rope.dim,
+            };
+            dispatch(
+                e,
+                &gated.gate,
+                &[s.mixed.at(0), s.q.at(0)],
+                bytes_of(&p),
+                [n.div_ceil(256), 1, 1],
+                256,
+            );
+        }
         w.out
             .apply(self, s.mixed.at(0), &self.scratch.projected, output.len());
     }
@@ -266,12 +295,96 @@ impl Bindings<'_> {
         w.v.apply_norm_concurrent(self, &s.v, m);
     }
 
+    /// Store the chunk's keys and values, rotate them and the live queries, and mix the
+    /// requested chunk-relative rows against the causal history.
     fn attention(
         &self,
         plan: &AttentionPlan,
         (s, state): (&AttentionScratch, &Kv),
         sinks: Option<&ReadOnly>,
         window: usize,
+        positions: Range<usize>,
+        output: Range<usize>,
+    ) {
+        self.rotate(plan, s, state, positions.clone(), output.clone());
+        // Storing every input's keys and values before pruning outputs; later tokens
+        // can attend to these rows even when no prediction is requested from this chunk.
+        if output.is_empty() {
+            return;
+        }
+        let pos = positions.start + output.start;
+        let keys = pos + output.len();
+        let keys = if window == 0 { keys } else { keys.min(window) };
+        let p = AttentionParams {
+            window: window as u32,
+            sinks: sinks.is_some() as u32,
+            ..AttentionParams::new(plan, pos, output.len(), 0)
+        };
+        self.attend(plan, s, state, s.rotated.at(0), sinks, p, keys);
+    }
+
+    /// Mix every one of `rows` encoder rows against the first `keys` of them, with no causal
+    /// mask. Positions restart at zero: the layer's keys and values are transient, not history.
+    pub fn encoder_attention(
+        &self,
+        w: &AttentionProjections<Projection>,
+        plan: &AttentionPlan,
+        (s, state): (&AttentionScratch, &Kv),
+        rows: usize,
+        keys: usize,
+    ) {
+        debug_assert!(keys <= rows);
+        self.project_qkv(w, s, rows, 0..rows);
+        self.rotate(plan, s, state, 0..rows, 0..rows);
+        let p = AttentionParams::new(plan, 0, rows, keys);
+        self.attend(plan, s, state, s.rotated.at(0), None, p, keys);
+        w.out
+            .apply(self, s.mixed.at(0), &self.scratch.projected, rows);
+    }
+
+    /// Mix normalized decoder rows against `keys` precomputed encoder keys and values.
+    /// Queries are used as projected; the plan must not rotate them.
+    pub fn cross_attention(
+        &self,
+        q: &Projection,
+        out: &Projection,
+        plan: &AttentionPlan,
+        (s, cross): (&AttentionScratch, &Kv),
+        keys: usize,
+        rows: usize,
+    ) {
+        debug_assert_eq!(plan.rope.rope_dim, 0);
+        debug_assert_eq!(plan.rope.q_stride, 1);
+        self.prepare_norm_scales(&[&q.matrix], rows, 0..rows);
+        q.apply_norm(self, &s.q, rows);
+        let p = AttentionParams::new(plan, 0, rows, keys);
+        self.attend(plan, s, cross, s.q.at(0), None, p, keys);
+        out.apply(self, s.mixed.at(0), &self.scratch.projected, rows);
+    }
+
+    /// Convert projected keys and values of `rows` encoder outputs into the half-precision
+    /// cache layout attention reads, starting at key position zero.
+    pub fn store_cross_kv(
+        &self,
+        k: &Projection,
+        v: &Projection,
+        plan: &AttentionPlan,
+        (s, cross): (&AttentionScratch, &Kv),
+        rows: usize,
+    ) {
+        debug_assert_eq!(plan.rope.rope_dim, 0);
+        self.prepare_norm_scales(&[&k.matrix, &v.matrix], rows, 0..rows);
+        k.apply_norm(self, &s.k, rows);
+        v.apply_norm_concurrent(self, &s.v, rows);
+        self.rotate(plan, s, cross, 0..rows, 0..0);
+    }
+
+    /// Rotate and store keys and values for all `positions`, and rotate the `output` queries.
+    fn rotate(
+        &self,
+        plan: &AttentionPlan,
+        s: &AttentionScratch,
+        state: &Kv,
         positions: Range<usize>,
         output: Range<usize>,
     ) {
@@ -300,57 +413,59 @@ impl Bindings<'_> {
                 [(m * width).div_ceil(256), 1, 1],
                 256,
             );
-        } else {
-            // Reusing the original arithmetic for both ranges; splitting only the index geometry.
-            let kv = Rope { heads: 0, ..p };
-            dispatch(
+            return;
+        }
+        // Reusing the original arithmetic for both ranges; splitting only the index geometry.
+        let kv = Rope { heads: 0, ..p };
+        dispatch(
+            e,
+            &plan.pipelines.rope,
+            &buffers,
+            bytes_of(&kv),
+            [(2 * m * plan.key_width).div_ceil(256), 1, 1],
+            256,
+        );
+        if !output.is_empty() {
+            let q = Rope {
+                kv_heads: 0,
+                m: output.len() as u32,
+                pos: (positions.start + output.start) as u32,
+                ..p
+            };
+            dispatch_concurrent(
                 e,
                 &plan.pipelines.rope,
                 &buffers,
-                bytes_of(&kv),
-                [(2 * m * plan.key_width).div_ceil(256), 1, 1],
+                bytes_of(&q),
+                [(output.len() * plan.output_width).div_ceil(256), 1, 1],
                 256,
             );
-            if !output.is_empty() {
-                let q = Rope {
-                    kv_heads: 0,
-                    m: output.len() as u32,
-                    pos: (positions.start + output.start) as u32,
-                    ..p
-                };
-                dispatch_concurrent(
-                    e,
-                    &plan.pipelines.rope,
-                    &buffers,
-                    bytes_of(&q),
-                    [(output.len() * plan.output_width).div_ceil(256), 1, 1],
-                    256,
-                );
-            }
         }
-        // Storing every input's keys and values before pruning outputs; later tokens
-        // can attend to these rows even when no prediction is requested from this chunk.
-        if output.is_empty() {
-            return;
-        }
-        let m = output.len();
-        let first = output.start;
-        let p = AttentionParams {
-            heads: plan.rope.heads,
-            kv_heads: plan.rope.kv_heads,
-            dim: plan.rope.dim,
-            pos: (positions.start + first) as u32,
-            window: window as u32,
-            sinks: sinks.is_some() as u32,
-            scale: plan.scale,
-            m: m as u32,
-        };
+    }
+
+    /// Score `p.m` query rows against the stored keys and write the mixed rows.
+    /// `keys` counts the keys the longest row reads, which selects the kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn attend(
+        &self,
+        plan: &AttentionPlan,
+        s: &AttentionScratch,
+        state: &Kv,
+        q: (&BufferRef, usize),
+        sinks: Option<&ReadOnly>,
+        p: AttentionParams,
+        keys: usize,
+    ) {
+        let e = self.encoder;
+        let m = p.m as usize;
+        let window = p.window as usize;
         let sinks = sinks
             .map(ReadOnly::binding)
             .unwrap_or(self.scratch.next.at(0));
-        let keys = positions.start + first + m;
-        let keys = if window == 0 { keys } else { keys.min(window) };
+        // Splitting keys pays off only for grouped-query decoding over long causal history;
+        // cross-attention's single-head groups would leave most of each tile idle.
         if m == 1
+            && p.keys == 0
             && keys >= AttentionPlan::SPLIT_MIN_KEYS
             && let (Some(pipelines), Some(partials)) = (&plan.pipelines.split, &s.partials)
         {
@@ -365,7 +480,7 @@ impl Bindings<'_> {
                 e,
                 &pipelines.partial,
                 &[
-                    s.rotated.at(0),
+                    q,
                     state.k.binding(),
                     state.v.binding(),
                     sinks,
@@ -386,23 +501,30 @@ impl Bindings<'_> {
             );
             return;
         }
-        let (pipeline, threads, groups) = match (&plan.pipelines.wide, &plan.pipelines.tiled) {
-            (Some(pipeline), _) if AttentionPlan::wide_prefill(p.dim as usize, m, window) => {
-                (pipeline, 128, [plan.rope.heads as usize, m.div_ceil(16), 1])
-            }
-            (_, Some(pipeline)) if m >= 8 => {
-                (pipeline, 128, [plan.rope.heads as usize, m.div_ceil(8), 1])
-            }
-            _ => {
-                let (pipeline, threads) = plan.pipelines.dispatch.select(m, keys);
-                (pipeline, threads, [plan.rope.heads as usize, m, 1])
-            }
-        };
+        let heads = plan.rope.heads as usize;
+        let pipelines = &plan.pipelines;
+        let (pipeline, threads, groups) =
+            match (&pipelines.block, &pipelines.wide, &pipelines.tiled) {
+                // Bidirectional batches share every key across all rows; the block tiles amortize them.
+                (Some(pipeline), _, _) if p.keys != 0 && m >= 8 => {
+                    (pipeline, 128, [heads, m.div_ceil(32), 1])
+                }
+                (_, Some(pipeline), _)
+                    if AttentionPlan::wide_prefill(p.dim as usize, m, window) =>
+                {
+                    (pipeline, 128, [heads, m.div_ceil(16), 1])
+                }
+                (_, _, Some(pipeline)) if m >= 8 => (pipeline, 128, [heads, m.div_ceil(8), 1]),
+                _ => {
+                    let (pipeline, threads) = plan.pipelines.dispatch.select();
+                    (pipeline, threads, [plan.rope.heads as usize, m, 1])
+                }
+            };
         dispatch(
             e,
             pipeline,
             &[
-                s.rotated.at(0),
+                q,
                 state.k.binding(),
                 state.v.binding(),
                 sinks,

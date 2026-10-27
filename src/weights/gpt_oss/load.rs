@@ -7,7 +7,7 @@ use crate::{
     tensor::WeightFormat,
     weights::{
         Architecture,
-        common::{AttentionProjections, CommonWeights, Layer},
+        common::{AttentionProjections, CommonWeights, Kernels, Layer},
         compute::{self, AttentionPlan, Norm, Rope},
         load::{Geometry, Import, Parameters, Selection, common_selection, common_weights, import},
         operands::{ExpertWeight, Router},
@@ -208,8 +208,7 @@ pub fn load(file: &Gguf, p: &Parameters<'_>, g: Geometry) -> Result<Architecture
         embedding,
         output,
         output_norm,
-        norm,
-        pipelines,
+        kernels: Kernels { pipelines, norm },
     };
     let weights = GptOss {
         base,

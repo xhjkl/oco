@@ -81,7 +81,7 @@ impl QwenDelta {
             } else {
                 0..positions.len()
             };
-            compute.norm(&layer.norm, s.hidden.binding(), &s.norm, positions.len());
+            compute.enter_layer(&layer.norm, positions.len(), index > 0);
             compute.delta(
                 &layer.mixer,
                 &self.delta,
@@ -96,7 +96,10 @@ impl QwenDelta {
             let rows = output.len();
             let hidden = s.hidden.at(output.start * self.base.embedding.width * 2);
             compute.add_norm(&layer.post_norm, &s.projected, hidden, &s.norm, rows);
-            compute.feed_forward(&layer.ff, self.ffn_width, hidden, rows);
+            compute.feed_forward(&layer.ff, self.ffn_width, rows);
+            if index + 1 == self.layers.len() {
+                compute.add(&s.projected, hidden, rows);
+            }
         }
     }
 }

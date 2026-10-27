@@ -1,14 +1,17 @@
 #![doc = include_str!("../README.md")]
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 compile_error!("Oco currently requires Apple Silicon, macOS, and Metal");
+pub mod audio;
 mod gguf;
 mod gpu;
 mod tensor;
 mod tokenizer;
 mod weights;
+pub mod whisper;
 
 pub use tokenizer::{Decoder, TokenKind, Tokenizer};
 pub use weights::{Inference, Session, Weights};
+pub use whisper::{Transcriber, Transcript, Whisper};
 
 use anyhow::Result;
 use gguf::Gguf;
@@ -21,7 +24,17 @@ use std::path::Path;
 /// GPU work uses it. Loading does not run inference.
 pub fn load(path: impl AsRef<Path>) -> Result<Weights> {
     let file = Gguf::open(path.as_ref(), weights::METADATA)?;
-    weights::load(&file)
+    weights::load(&file, None)
+}
+
+/// Load a speech-recognition language model together with its audio encoder (`mmproj`) GGUF.
+///
+/// Sessions of the result accept audio through [`Session::embed_audio`], which returns IDs to
+/// splice into prompts next to ordinary tokens. Both files stay mapped like [`load`]'s.
+pub fn load_asr(text: impl AsRef<Path>, audio: impl AsRef<Path>) -> Result<Weights> {
+    let file = Gguf::open(text.as_ref(), weights::METADATA)?;
+    let audio = Gguf::open(audio.as_ref(), weights::AUDIO_METADATA)?;
+    weights::load(&file, Some(&audio))
 }
 
 /// Render and reset the per-kernel GPU timing accumulated since the last report.
@@ -50,7 +63,7 @@ pub fn inspect(path: impl AsRef<Path>) -> Result<ModelInfo> {
     anyhow::ensure!(
         matches!(
             architecture.as_str(),
-            "qwen35" | "gpt-oss" | "nemotron_h_moe"
+            "qwen35" | "qwen3" | "qwen3vl" | "gpt-oss" | "nemotron_h_moe"
         ),
         "unsupported architecture {architecture}"
     );

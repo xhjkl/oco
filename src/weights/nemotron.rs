@@ -30,7 +30,10 @@ pub struct NemotronLayer {
 /// Per-block choice of operation, with slots into the matching session history arrays.
 #[allow(clippy::large_enum_variant)]
 pub enum Mixer {
-    Mamba { weights: Mamba, slot: usize },
+    Mamba {
+        weights: Mamba,
+        slot: usize,
+    },
     Attention {
         weights: AttentionProjections<Projection>,
         slot: usize,
@@ -144,14 +147,24 @@ impl Nemotron {
                     compute.add_norm(&layer.norm, &s.projected, hidden, &s.norm, live.len());
                 }
                 Some(added) => {
-                    compute.add(&s.projected, s.hidden.at(added.start * width * 2), added.len());
+                    compute.add(
+                        &s.projected,
+                        s.hidden.at(added.start * width * 2),
+                        added.len(),
+                    );
                     compute.norm(&layer.norm, hidden, &s.norm, live.len());
                 }
                 None => compute.norm(&layer.norm, hidden, &s.norm, live.len()),
             }
             match &layer.mixer {
                 Mixer::Experts(weights) => {
-                    compute.relu_experts(weights, &self.experts, &memory.routing, hidden, live.len());
+                    compute.relu_experts(
+                        weights,
+                        &self.experts,
+                        &memory.routing,
+                        hidden,
+                        live.len(),
+                    );
                 }
                 Mixer::Mamba { weights, slot } => {
                     compute.mamba(
@@ -176,7 +189,11 @@ impl Nemotron {
             }
         }
         if let Some(added) = pending.filter(|added| !added.is_empty()) {
-            compute.add(&s.projected, s.hidden.at(added.start * width * 2), added.len());
+            compute.add(
+                &s.projected,
+                s.hidden.at(added.start * width * 2),
+                added.len(),
+            );
         }
     }
 }

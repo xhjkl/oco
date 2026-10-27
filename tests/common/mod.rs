@@ -100,7 +100,9 @@ pub fn prompt(
                 "You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-27\n\nReasoning: low\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.",
             );
             if tool.is_some() {
-                header.push_str("\nCalls to these tools must go to the commentary channel: 'functions'.");
+                header.push_str(
+                    "\nCalls to these tools must go to the commentary channel: 'functions'.",
+                );
             }
             tokens.extend(tokenizer.encode(&header)?);
             tokens.push(end);

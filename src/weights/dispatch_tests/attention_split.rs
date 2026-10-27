@@ -151,6 +151,7 @@ fn fixture(
                 sinks: u32::from(sinks),
                 scale: 1.0 / (dim as f32).sqrt(),
                 m: rows as u32,
+                keys: 0,
             },
             splits: 32,
         },

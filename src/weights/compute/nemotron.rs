@@ -1,11 +1,14 @@
 //! Nemotron-H operations: the Mamba-2 history mixer and sigmoid-routed relu² experts.
 use super::{Bindings, matrix::Matrix};
-use crate::gpu::{BufferRef, Pipeline, ReadOnly, dispatch, dispatch_concurrent, dispatch_indirect};
-use crate::weights::{operands::DenseMatrix, pipelines::Builder};
+use crate::gpu::{BufferRef, ReadOnly, dispatch, dispatch_concurrent, dispatch_indirect};
 use crate::weights::{
     nemotron::{Mamba, ReluExperts},
     pipelines::NemotronPipelines,
     state::{MambaScratch, Recurrence, Routing},
+};
+use crate::weights::{
+    operands::{DenseMatrix, Vector},
+    pipelines::Builder,
 };
 use bytemuck::{Pod, Zeroable, bytes_of};
 use std::ops::Range;
@@ -128,9 +131,9 @@ pub struct ReluExpertPlan {
     down: Matrix,
     router: RouterParams,
     pub shared_width: usize,
-    /// Single-row kernels for the shared expert's encoding, plain and relu²-input.
-    shared_vector: Pipeline,
-    shared_vector_relu: Pipeline,
+    /// Single-row kernels for the shared expert's up (plain) and down (relu²-input) products.
+    shared_vector: Vector,
+    shared_vector_relu: Vector,
 }
 
 impl ReluExpertPlan {
@@ -144,7 +147,7 @@ impl ReluExpertPlan {
         normalize: bool,
         scale: f32,
         pipelines: std::sync::Arc<NemotronPipelines>,
-        (shared_vector, shared_vector_relu): (Pipeline, Pipeline),
+        (shared_vector, shared_vector_relu): (Vector, Vector),
     ) -> Self {
         let up = Matrix {
             k: hidden as u32,
@@ -305,8 +308,7 @@ impl Bindings<'_> {
             [(n as usize).div_ceil(256), 1, 1],
             256,
         );
-        w.shared_down
-            .apply(self, s.up.at(0), &s.projected, rows);
+        w.shared_down.apply(self, s.up.at(0), &s.projected, rows);
         self.add(&s.projected, residual, rows);
         // Routed experts: select, plan tiles per expert, gather, contract, and combine.
         // Relu² is applied as the down tiles load their inputs.
@@ -352,7 +354,12 @@ impl Bindings<'_> {
         dispatch_indirect(
             e,
             up,
-            &[w.up.binding(), s.norm.at(0), s.gate.at(0), routing.plan.binding()],
+            &[
+                w.up.binding(),
+                s.norm.at(0),
+                s.gate.at(0),
+                routing.plan.binding(),
+            ],
             bytes_of(&p),
             routing.plan.at(0),
             128,
@@ -364,7 +371,12 @@ impl Bindings<'_> {
         dispatch_indirect(
             e,
             down,
-            &[w.down.binding(), s.gate.at(0), s.projected.at(0), routing.plan.binding()],
+            &[
+                w.down.binding(),
+                s.gate.at(0),
+                s.projected.at(0),
+                routing.plan.binding(),
+            ],
             bytes_of(&p),
             routing.plan.at(12),
             128,
@@ -378,7 +390,12 @@ impl Bindings<'_> {
         dispatch(
             e,
             &pipelines.moe_add,
-            &[s.projected.at(0), routing.prob.at(0), residual, s.next.binding()],
+            &[
+                s.projected.at(0),
+                routing.prob.at(0),
+                residual,
+                s.next.binding(),
+            ],
             bytes_of(&p),
             [(rows * hidden).div_ceil(256), 1, 1],
             256,
@@ -410,8 +427,18 @@ impl Bindings<'_> {
             has_bias: bias.is_some() as u32,
         };
         let dummy = s.next.binding();
-        let up_bias = w.shared_up.bias.as_ref().map(ReadOnly::binding).unwrap_or(dummy);
-        let down_bias = w.shared_down.bias.as_ref().map(ReadOnly::binding).unwrap_or(dummy);
+        let up_bias = w
+            .shared_up
+            .bias
+            .as_ref()
+            .map(ReadOnly::binding)
+            .unwrap_or(dummy);
+        let down_bias = w
+            .shared_down
+            .bias
+            .as_ref()
+            .map(ReadOnly::binding)
+            .unwrap_or(dummy);
         // Stage 1: router and shared up both read the normalized row.
         dispatch(
             e,
@@ -428,10 +455,9 @@ impl Bindings<'_> {
             256,
         );
         let up = &w.shared_up.matrix;
-        let threads = Builder::vector_threads(up.output);
         dispatch_concurrent(
             e,
-            &plan.shared_vector,
+            &plan.shared_vector.pipeline,
             &[
                 up.values.binding(),
                 s.norm.at(0),
@@ -440,8 +466,8 @@ impl Bindings<'_> {
                 dummy,
             ],
             bytes_of(&dense(up, w.shared_up.bias.as_ref())),
-            [up.output.div_ceil(threads / 8), 1, 1],
-            threads,
+            [plan.shared_vector.column_groups, 1, 1],
+            plan.shared_vector.threads,
         );
         // Stage 2: routed up needs the selection; shared down needs only the shared up.
         let p = Matrix {
@@ -464,10 +490,9 @@ impl Bindings<'_> {
             threads,
         );
         let down = &w.shared_down.matrix;
-        let threads = Builder::vector_threads(down.output);
         dispatch_concurrent(
             e,
-            &plan.shared_vector_relu,
+            &plan.shared_vector_relu.pipeline,
             &[
                 down.values.binding(),
                 s.up.at(0),
@@ -476,8 +501,8 @@ impl Bindings<'_> {
                 dummy,
             ],
             bytes_of(&dense(down, w.shared_down.bias.as_ref())),
-            [down.output.div_ceil(threads / 8), 1, 1],
-            threads,
+            [plan.shared_vector_relu.column_groups, 1, 1],
+            plan.shared_vector_relu.threads,
         );
         // Stage 3: routed down over the activated expert intermediates.
         let p = Matrix {

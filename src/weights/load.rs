@@ -41,7 +41,11 @@ pub struct Parameters<'a> {
     prefix: &'a str,
 }
 
-impl Parameters<'_> {
+impl<'a> Parameters<'a> {
+    pub fn new(file: &'a Gguf, prefix: &'a str) -> Self {
+        Self { file, prefix }
+    }
+
     pub fn number(&self, key: &str) -> Result<f64> {
         self.file.number(&format!("{}.{key}", self.prefix))
     }
@@ -126,7 +130,7 @@ pub struct Selection<'a> {
 }
 
 impl<'a> Selection<'a> {
-    fn new(directory: &'a HashMap<&'a str, gguf::Entry>) -> Self {
+    pub fn new(directory: &'a HashMap<&'a str, gguf::Entry>) -> Self {
         Self {
             directory,
             spans: HashMap::new(),
@@ -270,17 +274,22 @@ impl Import {
     }
 }
 
-pub(crate) fn load(file: &Gguf) -> Result<Weights> {
+pub(crate) fn load(file: &Gguf, audio: Option<&Gguf>) -> Result<Weights> {
     let prefix = file.text("general.architecture")?;
     let p = Parameters { file, prefix };
     let inner = match prefix {
+        "qwen35" => {
+            let g = p.geometry()?;
+            qwen::load(file, &p, g, qwen::Dialect::Qwen35, audio)?
+        }
+        "qwen3" | "qwen3vl" => {
+            let g = p.geometry()?;
+            qwen::load(file, &p, g, qwen::Dialect::Qwen3, audio)?
+        }
+        _ if audio.is_some() => bail!("{prefix} does not accept an audio encoder"),
         "gpt-oss" => {
             let g = p.geometry()?;
             gpt_oss::load(file, &p, g)?
-        }
-        "qwen35" => {
-            let g = p.geometry()?;
-            qwen::load(file, &p, g)?
         }
         "nemotron_h_moe" => nemotron::load(file, &p)?,
         _ => bail!("unsupported architecture {prefix}"),
@@ -310,7 +319,16 @@ pub fn common_selection<'a>(
         !directory.contains_key("token_embd.bias"),
         "token_embd.bias is unsupported by embedding lookup"
     );
-    let output = s.projection_with_optional_bias("output", g.hidden, vocabulary)?;
+    // Checkpoints with tied word embeddings omit the output matrix and reuse the lookup table.
+    let output = if directory.contains_key("output.weight") {
+        Some(s.projection_with_optional_bias("output", g.hidden, vocabulary)?)
+    } else {
+        ensure!(
+            !directory.contains_key("output.bias"),
+            "output.bias without output.weight"
+        );
+        None
+    };
     let norm = s.float("output_norm.weight", &[g.hidden])?;
     Ok((
         s,
@@ -340,20 +358,33 @@ pub fn common_weights(
     i: &mut Import,
     selected::Common {
         embedding,
-        output: selected::Projection { matrix, bias },
+        output,
         norm,
     }: selected::Common<'_>,
 ) -> Result<(Embedding, Output, ReadOnly, ElementwisePipelines)> {
     let embedding = i.tensor(embedding)?;
-    let embedding = i.builder.embedding(embedding)?;
-    let matrix = i.tensor(matrix)?;
-    let bias = match bias {
-        None => None,
-        Some(bias) => {
-            let bias = i.binding(bias)?;
-            Some(bias)
+    let (matrix, bias) = match output {
+        Some(selected::Projection { matrix, bias }) => {
+            let matrix = i.tensor(matrix)?;
+            let bias = match bias {
+                None => None,
+                Some(bias) => {
+                    let bias = i.binding(bias)?;
+                    Some(bias)
+                }
+            };
+            (matrix, bias)
         }
+        None => (
+            Tensor::bound(
+                embedding.storage.clone(),
+                embedding.kind,
+                &embedding.shape[..2],
+            )?,
+            None,
+        ),
     };
+    let embedding = i.builder.embedding(embedding)?;
     let output = i.builder.output(matrix, bias)?;
     let norm = i.binding(norm)?;
     let pipelines = i.builder.elementwise()?;
@@ -408,6 +439,27 @@ pub(crate) const METADATA: &[&str] = &[
     "qwen35.ssm.inner_size",
     "qwen35.ssm.state_size",
     "qwen35.ssm.conv_kernel",
+    "qwen3.embedding_length",
+    "qwen3.attention.head_count",
+    "qwen3.attention.head_count_kv",
+    "qwen3.attention.key_length",
+    "qwen3.attention.layer_norm_rms_epsilon",
+    "qwen3.feed_forward_length",
+    "qwen3.context_length",
+    "qwen3.block_count",
+    "qwen3.rope.freq_base",
+    "qwen3.rope.scaling.type",
+    "qwen3vl.embedding_length",
+    "qwen3vl.attention.head_count",
+    "qwen3vl.attention.head_count_kv",
+    "qwen3vl.attention.key_length",
+    "qwen3vl.attention.layer_norm_rms_epsilon",
+    "qwen3vl.feed_forward_length",
+    "qwen3vl.context_length",
+    "qwen3vl.block_count",
+    "qwen3vl.rope.freq_base",
+    "qwen3vl.rope.scaling.type",
+    "qwen3vl.n_deepstack_layers",
     "nemotron_h_moe.embedding_length",
     "nemotron_h_moe.attention.head_count",
     "nemotron_h_moe.attention.head_count_kv",
