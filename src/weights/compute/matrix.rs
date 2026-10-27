@@ -69,17 +69,17 @@ impl DenseMatrix {
         row: usize,
     ) {
         debug_assert!(row < rows);
-        let (pipeline, columns, threads) = match &self.plan {
-            DensePlan::Vector(v) => (&v.pipeline, v.column_groups, v.threads),
+        let (pipeline, groups, threads) = match &self.plan {
+            DensePlan::Vector(v) => (&v.pipeline, [v.column_groups, 1, 1], v.threads),
             DensePlan::Tiled {
                 vector: v,
                 vector_rows,
                 ..
-            } if rows <= *vector_rows => (&v.pipeline, v.column_groups, v.threads),
+            } if rows <= *vector_rows => (&v.pipeline, [v.column_groups, 1, 1], v.threads),
             DensePlan::Tiled { narrow, .. } => {
                 // Keeping the matrix reduction; the smallest tile avoids discarded query rows.
                 let tile = &narrow[0];
-                (&tile.pipeline, tile.column_groups, 128)
+                (&tile.pipeline, [1, tile.column_groups, 1], 128)
             }
         };
         let p = Matrix {
@@ -105,11 +105,6 @@ impl DenseMatrix {
             bias,
             scales,
         ];
-        let groups = if threads == 128 {
-            [1, columns, 1]
-        } else {
-            [columns, 1, 1]
-        };
         dispatch(
             compute.encoder,
             pipeline,

@@ -139,7 +139,6 @@ pub enum GeluForm {
 pub struct GeluFfn {
     pub up: Projection,
     pub down: Projection,
-    pub width: usize,
     pub form: GeluForm,
 }
 
@@ -360,7 +359,7 @@ impl Bindings<'_> {
         let s = self.scratch;
         self.prepare_norm_scales(&[&w.up.matrix], rows, 0..rows);
         w.up.apply_norm(self, &s.up, rows);
-        self.gelu(a, s.up.at(0), rows * w.width, w.form);
+        self.gelu(a, s.up.at(0), rows * w.up.matrix.output, w.form);
         w.down.apply(self, s.up.at(0), y, rows);
     }
 }

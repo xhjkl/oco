@@ -306,7 +306,6 @@ impl<'a> Store<'a> {
         Ok(GeluFfn {
             up: self.biased(builder, &format!("{prefix}.mlp.0"), width, 4 * width)?,
             down: self.biased(builder, &format!("{prefix}.mlp.2"), 4 * width, width)?,
-            width: 4 * width,
             form: GeluForm::Tanh,
         })
     }

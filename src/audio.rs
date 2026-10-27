@@ -127,17 +127,7 @@ pub fn centered_log_mel(samples: &[f32], filters: &MelFilters) -> Result<Spectro
     let tail = samples.len() - 1;
     padded.extend(samples[tail - half..tail].iter().rev());
     let frames = (padded.len() - FFT_SIZE) / HOP + 1;
-    let kept = (samples.len() / HOP + 1).min(frames);
-    let full = spectrogram(&padded, frames, frames, filters, FLOOR);
-    let mut data = Vec::with_capacity(kept * full.mels);
-    for m in 0..full.mels {
-        data.extend_from_slice(&full.data[m * frames..m * frames + kept]);
-    }
-    Ok(Spectrogram {
-        mels: full.mels,
-        frames: kept,
-        data,
-    })
+    Ok(spectrogram(&padded, frames, frames, filters, FLOOR))
 }
 
 /// Power-spectrum frames projected onto the filters, in log10, then normalized like Whisper.

@@ -22,6 +22,85 @@ use futures_lite::{
 };
 
 #[test]
+fn audio_embedding_preserves_position_and_reset_forgets_unconsumed_features() -> Result<()> {
+    block_on(async {
+        let weights = audio_weights()?;
+        let samples = vec![0.1f32; 201];
+        for consumed in [0, 1] {
+            let mut session = Session::new(&weights, 32)?;
+            if consumed > 0 {
+                let mut inference = session.infer(vec![1])?;
+                let token = inference.next().await?;
+                assert!(token.is_some());
+            }
+            let invalid = session.embed_audio(&[]).await;
+            assert!(invalid.is_err());
+            assert_eq!(session.position()?, consumed);
+            let ids = session.embed_audio(&samples).await?;
+            assert_eq!(ids.len(), 13);
+            assert_eq!(session.position()?, consumed);
+            let more = session.embed_audio(&samples).await?;
+            assert_eq!(more[0], ids[0] + 13);
+            let overflow = session.embed_audio(&samples).await;
+            assert!(overflow.is_err());
+            assert_eq!(session.position()?, consumed);
+            session.reset()?;
+            let stale = session.infer(vec![ids[0]]);
+            assert!(stale.is_err());
+            drop(stale);
+            let fresh = session.embed_audio(&samples).await?;
+            assert_eq!(fresh, ids);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn cancelled_audio_embedding_remains_unusable_after_gpu_completion() -> Result<()> {
+    block_on(async {
+        let weights = audio_weights()?;
+        let samples = vec![0.1f32; 201];
+        for consumed in [0, 1] {
+            let mut session = Session::new(&weights, 32)?;
+            if consumed > 0 {
+                let mut inference = session.infer(vec![1])?;
+                let token = inference.next().await?;
+                assert!(token.is_some());
+            }
+            drop(session.embed_audio(&samples));
+            assert_eq!(session.position()?, consumed);
+            let queue = session.compute.queue.clone();
+            let gate = Gate::new(&queue);
+            let pending = poll_once(session.embed_audio(&samples)).await;
+            assert!(pending.is_none());
+            assert!(session.position().is_err());
+            let reset = session.reset();
+            assert!(reset.is_err());
+            let retry = session.embed_audio(&samples).await;
+            assert!(retry.is_err());
+            drop(gate);
+            drain(&queue)?;
+            assert!(session.position().is_err());
+            let retry = session.embed_audio(&samples).await;
+            assert!(retry.is_err());
+        }
+        Ok(())
+    })
+}
+
+/// Attach a small encoder to the existing submission lifecycle graph.
+fn audio_weights() -> Result<Architecture> {
+    let mut weights = weights(1.0)?;
+    let Architecture::QwenAttention(model) = &mut weights else {
+        unreachable!()
+    };
+    let model = Arc::get_mut(model).unwrap();
+    let encoder = crate::weights::qwen::audio::tests::encoder(&model.base.gpu, 64)?;
+    model.audio = Some(encoder);
+    Ok(weights)
+}
+
+#[test]
 fn producer_backpressure_and_receiver_closure_bound_consumed_input() -> Result<()> {
     block_on(async {
         let weights = weights(1.0)?;

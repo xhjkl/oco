@@ -130,6 +130,7 @@ impl Session {
         let vocabulary = self.vocabulary_size();
         let width = encoder.output * 2;
         let mut ids = Vec::with_capacity(total);
+        let progress = std::mem::replace(&mut self.progress, Progress::Unusable);
         for window in &windows {
             scratch.mel.write(0, &window.mel);
             let rows = window.tokens();
@@ -142,12 +143,12 @@ impl Session {
                 };
                 encoder.encode(&compute, scratch, window.chunks, &destination);
             });
-            // Partial encodings are harmless: unreferenced rows are never read.
             submission.await?;
             ids.extend((used..used + rows).map(|row| (vocabulary + row) as u32));
             used += rows;
         }
         self.features = used;
+        self.progress = progress;
         Ok(ids)
     }
 
@@ -222,6 +223,7 @@ impl Session {
     /// it cannot recover one whose GPU work failed or was cancelled.
     pub fn reset(&mut self) -> Result<()> {
         let position = self.position()?;
+        self.features = 0;
         if position == 0 {
             return Ok(());
         }
@@ -237,7 +239,6 @@ impl Session {
             state.reset();
         }
         self.progress = Progress::Empty;
-        self.features = 0;
         Ok(())
     }
 

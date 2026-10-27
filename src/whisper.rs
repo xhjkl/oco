@@ -5,6 +5,8 @@
 //! one greedy token per submission, while the host applies Whisper's logit rules. The encoder
 //! and decoder reuse the dense, attention, and audio kernels of the language models.
 mod load;
+#[cfg(test)]
+mod tests;
 mod vocabulary;
 
 use crate::{
@@ -96,9 +98,11 @@ impl Whisper {
 
 /// Mutable state for transcribing one recording at a time: encoder scratch, the encoded
 /// audio as cross-attention keys and values, and the decoder's own history.
+/// Failed or cancelled GPU work makes the transcriber unusable.
 pub struct Transcriber {
     model: Arc<Model>,
     compute: Compute,
+    usable: bool,
     mel: BufferView,
     unfolded: BufferView,
     stage: BufferView,
@@ -162,6 +166,7 @@ impl Transcriber {
         let a = p.allocate(&m.gpu)?;
         Ok(Self {
             compute: Compute::new(&m.gpu, None),
+            usable: true,
             mel: a.get(mel),
             unfolded: a.get(unfolded),
             stage: a.get(stage),
@@ -185,6 +190,10 @@ impl Transcriber {
         samples: &[f32],
         language: Option<&str>,
     ) -> Result<Transcript> {
+        ensure!(
+            self.usable,
+            "transcriber is unusable; create a new transcriber"
+        );
         let m = self.model.clone();
         let v = &m.vocabulary;
         // English-only checkpoints have no language or task tokens and take no language.
@@ -210,6 +219,8 @@ impl Transcriber {
         let mut text = Vec::new();
         let mut tokens = 0;
         let mut detected = None;
+        // Invalidating before submission; cancellation cannot expose abandoned mutable buffers.
+        self.usable = false;
         for start in (0..content).step_by(WHISPER_FRAMES) {
             if start > 0 && start + 100 >= content {
                 break;
@@ -256,6 +267,7 @@ impl Transcriber {
             .or(forced)
             .and_then(|token| v.language_code(token))
             .unwrap_or("en");
+        self.usable = true;
         Ok(Transcript {
             text: String::from_utf8_lossy(&text).trim().to_owned(),
             language,

@@ -26,6 +26,9 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 
+#[cfg(test)]
+pub(crate) mod tests;
+
 /// Mel frames per convolution chunk and per attention window.
 pub const CHUNK_FRAMES: usize = 100;
 pub const WINDOW_FRAMES: usize = 800;
@@ -385,7 +388,6 @@ pub fn load(file: &Gguf, gpu: &Gpu, output: usize) -> Result<AudioEncoder> {
             ffn: GeluFfn {
                 up: i.biased(up)?,
                 down: i.biased(down)?,
-                width: ffn_width,
                 form: GeluForm::Erf,
             },
         });
@@ -393,7 +395,6 @@ pub fn load(file: &Gguf, gpu: &Gpu, output: usize) -> Result<AudioEncoder> {
     let projector = GeluFfn {
         up: i.biased(mm1)?,
         down: i.biased(mm2)?,
-        width,
         form: GeluForm::Erf,
     };
     let rope = Rope::unrotated(heads, heads, dim);
