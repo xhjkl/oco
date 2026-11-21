@@ -1,5 +1,6 @@
 //! Hybrid Qwen layers with typed slots into separate attention and recurrent history.
 use super::{QwenLayer, attention::GatedAttention, delta::Delta};
+use crate::Result;
 use crate::gpu::arena::Plan;
 use crate::weights::{
     common::CommonWeights,
@@ -7,7 +8,6 @@ use crate::weights::{
     pipelines::GatedAttentionPipelines,
     state::*,
 };
-use anyhow::Result;
 use std::ops::Range;
 
 pub struct QwenHybrid {

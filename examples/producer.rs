@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use common::Result;
 use futures_lite::StreamExt;
 use std::io::{self, Write};
 mod common;
@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
     let capacity = tokens
         .len()
         .checked_add(255)
-        .context("context capacity overflow")?;
+        .ok_or("context capacity overflow")?;
     let capacity = capacity.min(weights.context_limit());
     let mut session = weights.new_session(capacity)?;
     let (produce, mut tokens) = session.infer(tokens)?.into_producer();
@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
             output.flush()?;
         }
         writeln!(output, "{}", decoder.finish())?;
-        anyhow::Ok(())
+        Result::Ok(())
     };
     let ((), result) = tokio::join!(produce, consume);
     result

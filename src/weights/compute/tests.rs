@@ -1,10 +1,10 @@
 use super::{Bindings, Compute, Gpu};
+use crate::Result;
 use crate::{
     gpu::{BufferView, arena::Plan},
     tensor::{Tensor, WeightFormat},
     weights::{operands::Projection, pipelines::Builder, state::CommonScratch},
 };
-use anyhow::Result;
 use half::{bf16, f16};
 use memmap2::MmapMut;
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};

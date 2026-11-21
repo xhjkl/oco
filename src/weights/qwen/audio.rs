@@ -2,6 +2,7 @@
 //! convolutions over 100-frame mel chunks, a ViT-style transformer attending within one
 //! window of up to eight chunks, and an MLP projector onto the language model's width.
 //! Its output rows are spliced into the token stream by IDs past the vocabulary.
+use crate::error::{Context, Error, Result, ensure};
 use crate::{
     audio::{self, MelFilters},
     gguf::Gguf,
@@ -22,7 +23,6 @@ use crate::{
         state::{AttentionScratch, CommonScratch, Kv, bind_kv_states, kv_states, product},
     },
 };
-use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 
@@ -228,7 +228,7 @@ fn bind_layer_norm(i: &mut Import, [weight, bias]: [Selected<'_>; 2]) -> Result<
 fn mapped_f16(file: &Gguf, t: &Selected<'_>) -> Result<Vec<u16>> {
     ensure!(
         t.kind == WeightFormat::F16,
-        "convolution weights must be F16"
+        Error::Checkpoint("convolution weights must be F16")
     );
     Ok(half_bits(&file.map[t.offset..t.offset + t.bytes]))
 }
@@ -246,11 +246,11 @@ fn convolution(
     let name = format!("a.conv2d.{index}.weight");
     let entry = directory
         .get(name.as_str())
-        .with_context(|| format!("missing tensor {name}"))?;
+        .with_context(Error::Checkpoint, || format!("missing tensor {name}"))?;
     let t = entry.select()?;
     ensure!(
         t.shape == [TAPS, TAPS, channels, CHANNELS],
-        "unexpected convolution shape for {name}"
+        Error::Checkpoint("unexpected convolution shape for {name}")
     );
     let source = mapped_f16(file, &t)?;
     let bias = i.binding(bias)?;
@@ -273,12 +273,12 @@ fn convolution(
 pub fn load(file: &Gguf, gpu: &Gpu, output: usize) -> Result<AudioEncoder> {
     ensure!(
         file.text("general.architecture")? == "clip" && file.boolean("clip.has_audio_encoder")?,
-        "not an audio encoder GGUF"
+        Error::Checkpoint("not an audio encoder GGUF")
     );
     let projector = file.text("clip.audio.projector_type")?;
     ensure!(
         projector == "qwen3a",
-        "unsupported audio projector {projector}"
+        Error::Checkpoint("unsupported audio projector {projector}")
     );
     let p = Parameters::new(file, "clip.audio");
     let width = p.integer("embedding_length")?;
@@ -290,25 +290,28 @@ pub fn load(file: &Gguf, gpu: &Gpu, output: usize) -> Result<AudioEncoder> {
     let projection = p.integer("projection_dim")?;
     ensure!(
         projection == output,
-        "audio projector width does not match the language model"
+        Error::Checkpoint("audio projector width does not match the language model")
     );
     ensure!(
         width.is_multiple_of(64)
             && ffn_width.is_multiple_of(64)
             && heads > 0
             && width.is_multiple_of(heads),
-        "unsupported audio encoder geometry"
+        Error::Checkpoint("unsupported audio encoder geometry")
     );
     let dim = width / heads;
     ensure!(
         matches!(dim, 64 | 128 | 256),
-        "unsupported audio head width {dim}"
+        Error::Checkpoint("unsupported audio head width {dim}")
     );
     ensure!(
         epsilon.is_finite() && epsilon > 0.0,
-        "invalid layer norm epsilon"
+        Error::Checkpoint("invalid layer norm epsilon")
     );
-    ensure!((1..=128).contains(&count), "unsupported audio layer count");
+    ensure!(
+        (1..=128).contains(&count),
+        Error::Checkpoint("unsupported audio layer count")
+    );
     let directory = file.directory()?;
     let mut s = Selection::new(&directory);
     let positions = s.tensor("a.position_embd.weight")?;
@@ -317,7 +320,7 @@ pub fn load(file: &Gguf, gpu: &Gpu, output: usize) -> Result<AudioEncoder> {
             && positions.shape.len() == 2
             && positions.shape[0] == width
             && positions.shape[1] >= CHUNK_TOKENS,
-        "invalid audio position table"
+        Error::Checkpoint("invalid audio position table")
     );
     let conv_out = s.tensor("a.conv_out.weight")?;
     let post_norm = layer_norm(&mut s, "a.post_ln", width)?;
@@ -344,7 +347,9 @@ pub fn load(file: &Gguf, gpu: &Gpu, output: usize) -> Result<AudioEncoder> {
     // Convolutions read their coefficients from the mapping and repack them into new storage.
     let mut biases = biases.into_iter();
     let mut stage = |i: &mut Import, index, shape| {
-        let bias = biases.next().context("missing convolution bias")?;
+        let bias = biases
+            .next()
+            .context(Error::Checkpoint, "missing convolution bias")?;
         convolution(file, &directory, i, gpu, index, bias, shape)
     };
     let first = stage(&mut i, 1, (1, CHUNK_FRAMES, mels))?;
@@ -356,13 +361,12 @@ pub fn load(file: &Gguf, gpu: &Gpu, output: usize) -> Result<AudioEncoder> {
     let channels = CHANNELS;
     ensure!(
         tokens == CHUNK_TOKENS,
-        "unexpected chunk token count {tokens}"
+        Error::Checkpoint("unexpected chunk token count {tokens}")
     );
     let features = mel_positions * channels;
     ensure!(
         conv_out.shape == [features, width],
-        "unexpected conv_out shape {:?}",
-        conv_out.shape
+        Error::Checkpoint("unexpected conv_out shape {:?}", conv_out.shape)
     );
     // conv_out consumes (channel, mel) features; the stages emit (mel, channel), so permute columns.
     let source = mapped_f16(file, &conv_out)?;

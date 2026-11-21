@@ -1,6 +1,6 @@
 use super::{BufferView, Gpu};
+use crate::error::{Context, Error, Result, ensure};
 use crate::gpu::Buffer;
-use anyhow::{Context, Result, ensure};
 use objc2_metal::MTLDevice;
 
 /// Storage request that lets session planning refer to a buffer before its physical placement is known.
@@ -31,12 +31,12 @@ impl Plan {
     pub fn slot(&mut self, elements: usize, element_bytes: usize) -> Result<Slot> {
         ensure!(
             elements > 0 && elements <= u32::MAX as usize,
-            "arena binding exceeds Metal element index range"
+            Error::Gpu("arena binding exceeds Metal element index range")
         );
-        ensure!(element_bytes > 0, "zero-sized arena element");
+        ensure!(element_bytes > 0, Error::Gpu("zero-sized arena element"));
         let bytes = elements
             .checked_mul(element_bytes)
-            .context("arena byte length overflow")?;
+            .context(Error::Gpu, "arena byte length overflow")?;
         let index = self.regions.len();
         self.regions.push(Region {
             index,
@@ -57,13 +57,13 @@ impl Plan {
         for region in &mut self.regions {
             ensure!(
                 region.bytes <= limit,
-                "one arena binding exceeds Metal's buffer limit"
+                Error::Gpu("one arena binding exceeds Metal's buffer limit")
             );
             let mut placement = None;
             for (buffer, used) in lengths.iter().enumerate() {
                 let start = used
                     .checked_next_multiple_of(256)
-                    .context("arena alignment overflow")?;
+                    .context(Error::Gpu, "arena alignment overflow")?;
                 if start <= limit && region.bytes <= limit - start {
                     placement = Some((buffer, start));
                     break;
@@ -75,7 +75,7 @@ impl Plan {
             });
             lengths[buffer] = start
                 .checked_add(region.bytes)
-                .context("arena size overflow")?;
+                .context(Error::Gpu, "arena size overflow")?;
             region.buffer = buffer;
             region.offset = start;
         }
@@ -83,18 +83,20 @@ impl Plan {
             *bytes = (*bytes).max(4);
             ensure!(
                 *bytes <= limit,
-                "minimum Metal allocation exceeds buffer limit"
+                Error::Gpu("minimum Metal allocation exceeds buffer limit")
             );
         }
         let total = lengths
             .iter()
             .try_fold(0usize, |a, &b| a.checked_add(b))
-            .context("aggregate arena size overflow")?;
+            .context(Error::Gpu, "aggregate arena size overflow")?;
         // Weights stay resident beside every session, so only the remainder is available;
         // other live sessions are not counted.
         ensure!(
             total <= budget.saturating_sub(gpu.weight_bytes()),
-            "this session's buffers exceed the working set left beside the model's weights"
+            Error::Request(
+                "this session's buffers exceed the working set left beside the model's weights"
+            )
         );
         self.regions.sort_unstable_by_key(|r| r.index);
         let mut buffers = Vec::with_capacity(lengths.len());

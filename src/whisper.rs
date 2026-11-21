@@ -9,6 +9,7 @@ mod load;
 mod tests;
 mod vocabulary;
 
+use crate::error::{Context, Error, Result, bail, ensure};
 use crate::{
     audio::{self, MelFilters, WHISPER_FRAMES},
     gpu::{BufferView, Gpu, arena::Plan},
@@ -23,7 +24,6 @@ use crate::{
         state::{AttentionScratch, CommonScratch, Kv, bind_kv_states, kv_states, product},
     },
 };
-use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::{path::Path, sync::Arc};
 pub use vocabulary::LANGUAGES;
@@ -192,7 +192,7 @@ impl Transcriber {
     ) -> Result<Transcript> {
         ensure!(
             self.usable,
-            "transcriber is unusable; create a new transcriber"
+            Error::Request("transcriber is unusable; create a new transcriber")
         );
         let m = self.model.clone();
         let v = &m.vocabulary;
@@ -202,12 +202,13 @@ impl Transcriber {
             None => None,
             Some("en") if !multilingual => None,
             Some(code) if !multilingual => {
-                anyhow::bail!("this model transcribes only English, not {code}")
+                bail!(Error::Request(
+                    "this model transcribes only English, not {code}"
+                ))
             }
-            Some(code) => Some(
-                v.language(code)
-                    .with_context(|| format!("language {code} is unknown to this model"))?,
-            ),
+            Some(code) => Some(v.language(code).with_context(Error::Request, || {
+                format!("language {code} is unknown to this model")
+            })?),
         };
         let mut timings = Timings::default();
         let clock = std::time::Instant::now();
@@ -357,7 +358,7 @@ impl Transcriber {
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(index, _)| first + index)
-            .context("no language tokens")?;
+            .context(Error::Checkpoint, "no language tokens")?;
         Ok(best as u32)
     }
 
@@ -366,7 +367,7 @@ impl Transcriber {
         let rows = tokens.len();
         ensure!(
             rows > 0 && position + rows <= m.text_context,
-            "decoder context exhausted"
+            Error::Request("decoder context exhausted")
         );
         let s = &self.decoder;
         s.input.write(0, tokens);

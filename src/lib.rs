@@ -2,6 +2,7 @@
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 compile_error!("Oco currently requires Apple Silicon, macOS, and Metal");
 pub mod audio;
+mod error;
 mod gguf;
 mod gpu;
 mod tensor;
@@ -9,11 +10,12 @@ mod tokenizer;
 mod weights;
 pub mod whisper;
 
+pub use error::{Error, Result};
 pub use tokenizer::{Decoder, TokenKind, Tokenizer};
 pub use weights::{Inference, Session, Weights};
 pub use whisper::{Transcriber, Transcript, Whisper};
 
-use anyhow::Result;
+use error::{Context, ensure};
 use gguf::Gguf;
 use std::path::Path;
 
@@ -60,12 +62,12 @@ pub fn inspect(path: impl AsRef<Path>) -> Result<ModelInfo> {
         &["general.architecture", "general.name", "general.alignment"],
     )?;
     let architecture = file.text("general.architecture")?.to_owned();
-    anyhow::ensure!(
+    ensure!(
         matches!(
             architecture.as_str(),
             "qwen35" | "qwen3" | "qwen3vl" | "gpt-oss" | "nemotron_h_moe"
         ),
-        "unsupported architecture {architecture}"
+        Error::Checkpoint("unsupported architecture {architecture}")
     );
     let directory = file.directory()?;
     let mut parameters = 0u64;
@@ -74,12 +76,15 @@ pub fn inspect(path: impl AsRef<Path>) -> Result<ModelInfo> {
         let count = tensor.shape.iter().try_fold(1u64, |count, &dimension| {
             count.checked_mul(dimension as u64)
         });
-        let count = count.ok_or_else(|| anyhow::anyhow!("parameter count overflow"))?;
+        let count = count.context(Error::Checkpoint, "parameter count overflow")?;
         parameters = parameters
             .checked_add(count)
-            .ok_or_else(|| anyhow::anyhow!("parameter count overflow"))?;
+            .context(Error::Checkpoint, "parameter count overflow")?;
     }
-    anyhow::ensure!(parameters > 0, "checkpoint has no tensors");
+    ensure!(
+        parameters > 0,
+        Error::Checkpoint("checkpoint has no tensors")
+    );
     let name = file
         .text("general.name")
         .unwrap_or(&architecture)

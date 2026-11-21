@@ -1,6 +1,7 @@
 //! Audio-encoder kernels against host references: layer normalization, GELU, positional rows,
 //! convolution unfolding, and bidirectional attention.
 use super::GUARD;
+use crate::Result;
 use crate::weights::compute::AttentionParams;
 use crate::{
     gpu::{
@@ -13,7 +14,6 @@ use crate::{
         pipelines::Builder,
     },
 };
-use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use half::bf16;
 

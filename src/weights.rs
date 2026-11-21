@@ -26,8 +26,8 @@ mod qwen;
 pub(crate) mod session;
 pub(crate) mod state;
 
+use crate::Result;
 use crate::Tokenizer;
-use anyhow::Result;
 use common::CommonWeights;
 pub use generation::Inference;
 pub(crate) use load::{METADATA, load};

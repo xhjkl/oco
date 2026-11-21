@@ -1,5 +1,5 @@
 //! Whisper's token table and the special IDs whisper.cpp derives from the vocabulary size.
-use anyhow::{Result, ensure};
+use crate::error::{Result, ensure};
 
 /// Language codes in Whisper's token order; the token for index `i` is `sot + 1 + i`.
 pub const LANGUAGES: [&str; 100] = [
@@ -35,14 +35,14 @@ impl Vocabulary {
     pub fn new(tokens: Vec<Vec<u8>>, size: usize) -> Result<Self> {
         ensure!(
             tokens.len() <= size && size >= 51_864,
-            "unexpected Whisper vocabulary size {size}"
+            Error::Checkpoint("unexpected Whisper vocabulary size {size}")
         );
         let multilingual = size >= 51_865;
         let shift = u32::from(multilingual);
         let languages = if multilingual { size - 51_766 } else { 0 };
         ensure!(
             languages <= LANGUAGES.len(),
-            "vocabulary declares {languages} languages"
+            Error::Checkpoint("vocabulary declares {languages} languages")
         );
         // Multilingual models insert the language tokens after the start token.
         let dt = if multilingual {
@@ -53,7 +53,7 @@ impl Vocabulary {
         let timestamps = 50_363 + dt;
         ensure!(
             (timestamps as usize) < size,
-            "vocabulary has no room for timestamp tokens"
+            Error::Checkpoint("vocabulary has no room for timestamp tokens")
         );
         let space = tokens.iter().position(|t| t == b" ").map(|id| id as u32);
         Ok(Self {

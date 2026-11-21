@@ -13,11 +13,11 @@ use super::{
     compute::{AttentionPlan, DeltaPlan, MambaPlan},
     qwen::delta::{CONV_TAPS, KEY_WIDTH},
 };
+use crate::error::{Context, Error, Result};
 use crate::gpu::{
     BufferView,
     arena::{Arena, Plan, Slot},
 };
-use anyhow::{Context, Result};
 
 /// Maximum prompt tokens processed per submission, bounding scratch independently of history length.
 pub const MAX_PREFILL_ROWS: usize = 512;
@@ -140,7 +140,8 @@ impl Recurrence {
 }
 
 pub fn product(a: usize, b: usize) -> Result<usize> {
-    a.checked_mul(b).context("workspace element count overflow")
+    a.checked_mul(b)
+        .context(Error::Request, "workspace element count overflow")
 }
 
 impl CommonScratch<Slot> {

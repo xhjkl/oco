@@ -1,14 +1,14 @@
 //! Prefill and decode throughput for one checkpoint, comparable to llama-bench's pp/tg rows.
 //! Usage: bench MODEL.gguf [PROMPT_TOKENS=512] [GENERATED_TOKENS=128] [REPEATS=3]
-use anyhow::{Context, Result, ensure};
+use std::error::Error;
 use std::time::Instant;
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
-        .context("usage: bench MODEL.gguf [PROMPT] [GENERATED] [REPEATS]")?;
+        .ok_or("usage: bench MODEL.gguf [PROMPT] [GENERATED] [REPEATS]")?;
     let prompt_tokens: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(512);
     let generated: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(128);
     let repeats: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(3);
@@ -22,14 +22,16 @@ async fn main() -> Result<()> {
         prompt.extend(tokenizer.encode(text)?);
     }
     prompt.truncate(prompt_tokens);
-    ensure!(prompt.len() == prompt_tokens, "prompt too short");
+    if prompt.len() != prompt_tokens {
+        return Err("prompt too short".into());
+    }
     let mut prefill_rates = Vec::new();
     let mut decode_rates = Vec::new();
     for repeat in 0..repeats {
         let mut session = weights.new_session(prompt_tokens + generated)?;
         let mut inference = session.infer(prompt.clone())?;
         let begin = Instant::now();
-        let first = inference.next().await?.context("no prediction")?;
+        let first = inference.next().await?.ok_or("no prediction")?;
         let prefill = begin.elapsed();
         if let Some(report) = oco::profile_report() {
             eprintln!("--- prefill kernels (run {repeat})\n{report}");
@@ -38,7 +40,7 @@ async fn main() -> Result<()> {
         let mut last = first;
         let mut distinct = false;
         for _ in 1..generated {
-            let token = inference.next().await?.context("stream ended early")?;
+            let token = inference.next().await?.ok_or("stream ended early")?;
             distinct |= token != last;
             last = token;
         }

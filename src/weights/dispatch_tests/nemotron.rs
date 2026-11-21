@@ -1,10 +1,10 @@
 use super::{GUARD, SENTINEL};
+use crate::Result;
 use crate::gpu::{
     Gpu, dispatch,
     tests::{buffer, read},
 };
 use crate::weights::{compute::Compute, pipelines::Builder};
-use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use half::bf16;
 

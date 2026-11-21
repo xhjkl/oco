@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use common::Result;
 use std::io::{self, Write};
 mod common;
 
@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
     let capacity = tokens
         .len()
         .checked_add(255)
-        .context("context capacity overflow")?;
+        .ok_or("context capacity overflow")?;
     let capacity = capacity.min(weights.context_limit());
     let mut session = weights.new_session(capacity)?;
     let mut inference = session.infer(tokens)?;

@@ -1,4 +1,5 @@
 use super::{GUARD, noise};
+use crate::Result;
 use crate::{
     gpu::{
         Gpu, dispatch,
@@ -7,7 +8,6 @@ use crate::{
     tensor::WeightFormat,
     weights::{compute::Compute, pipelines::Builder},
 };
-use anyhow::Result;
 use half::{bf16, f16};
 
 #[path = "q4_prefill.rs"]

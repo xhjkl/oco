@@ -1,6 +1,7 @@
 //! Validate and bind GPT-OSS weights before constructing its concrete model.
 mod selected;
 use super::{ACTIVE_EXPERTS, EXPERT_COUNT, Experts, GptOss, SinkAttention};
+use crate::error::{Result, ensure};
 use crate::{
     gguf::Gguf,
     gpu::Gpu,
@@ -13,7 +14,6 @@ use crate::{
         operands::{ExpertWeight, Router},
     },
 };
-use anyhow::{Result, ensure};
 use std::sync::Arc;
 
 impl<'a> Selection<'a> {
@@ -23,7 +23,7 @@ impl<'a> Selection<'a> {
             input.is_multiple_of(64)
                 && values.shape == [input, output, EXPERT_COUNT]
                 && values.kind == WeightFormat::Mxfp4,
-            "invalid expert coefficients {name}"
+            Error::Checkpoint("invalid expert coefficients {name}")
         );
         let bias = self.float(&format!("{name}.bias"), &[output, EXPERT_COUNT])?;
         Ok(selected::Expert { values, bias })
@@ -33,7 +33,7 @@ impl<'a> Selection<'a> {
         let values = self.matrix(name, hidden, EXPERT_COUNT)?;
         ensure!(
             values.kind == WeightFormat::F32,
-            "router weights must be float32"
+            Error::Checkpoint("router weights must be float32")
         );
         let bias = self.float(&format!("{name}.bias"), &[EXPERT_COUNT])?;
         Ok(selected::Router { values, bias })
@@ -54,21 +54,27 @@ impl Import {
 pub fn load(file: &Gguf, p: &Parameters<'_>, g: Geometry) -> Result<Architecture> {
     p.scaling("yarn")?;
     let rope_dim = p.optional("rope.dimension_count", g.dim as f64)?;
-    ensure!(rope_dim == g.dim as f64, "GPT-OSS requires full-head RoPE");
+    ensure!(
+        rope_dim == g.dim as f64,
+        Error::Checkpoint("GPT-OSS requires full-head RoPE")
+    );
     let factor = p.number("rope.scaling.factor")?;
     ensure!(
         factor >= 1.0 && factor <= f32::MAX as f64,
-        "invalid RoPE scale"
+        Error::Checkpoint("invalid RoPE scale")
     );
     let factor = factor as f32;
     let original = p.number("rope.scaling.original_context_length")?;
     ensure!(
         original > 0.0 && original <= u32::MAX as f64 && original.fract() == 0.0,
-        "invalid original RoPE context"
+        Error::Checkpoint("invalid original RoPE context")
     );
     let fast = p.optional("rope.scaling.yarn_beta_fast", 32.0)?;
     let slow = p.optional("rope.scaling.yarn_beta_slow", 1.0)?;
-    ensure!(fast > 0.0 && slow > 0.0, "invalid YaRN beta");
+    ensure!(
+        fast > 0.0 && slow > 0.0,
+        Error::Checkpoint("invalid YaRN beta")
+    );
     let correction = |beta: f64| {
         g.dim as f64 * (original / (beta * 2.0 * std::f64::consts::PI)).ln()
             / (2.0 * (g.base as f64).ln())
@@ -77,19 +83,19 @@ pub fn load(file: &Gguf, p: &Parameters<'_>, g: Geometry) -> Result<Architecture
     let high = correction(slow).min((g.dim - 1) as f64) as f32;
     ensure!(
         low.is_finite() && high.is_finite() && high > low,
-        "invalid YaRN correction range"
+        Error::Checkpoint("invalid YaRN correction range")
     );
     let window = p.number("attention.sliding_window")?;
     ensure!(
         window >= 0.0 && window <= u32::MAX as f64 && window.fract() == 0.0,
-        "invalid sliding window"
+        Error::Checkpoint("invalid sliding window")
     );
     let window = window as usize;
     let expert_count = p.integer("expert_count")?;
     let expert_used = p.integer("expert_used_count")?;
     ensure!(
         expert_count == EXPERT_COUNT && expert_used == ACTIVE_EXPERTS,
-        "GPT-OSS currently requires 32 experts, 4 active"
+        Error::Checkpoint("GPT-OSS currently requires 32 experts, 4 active")
     );
     let rope = Rope {
         heads: g.heads as u32,

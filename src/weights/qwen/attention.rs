@@ -1,5 +1,6 @@
 //! Homogeneous Qwen gated-attention layers and their KV history.
 use super::{QwenLayer, audio};
+use crate::Result;
 use crate::gpu::{BufferView, ReadOnly, arena::Plan};
 use crate::weights::{
     common::{AttentionProjections, CommonWeights},
@@ -8,7 +9,6 @@ use crate::weights::{
     pipelines::GatedAttentionPipelines,
     state::*,
 };
-use anyhow::Result;
 use std::ops::Range;
 
 pub struct QwenAttention {

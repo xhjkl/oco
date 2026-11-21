@@ -1,9 +1,11 @@
 //! Conversation framing for the three supported checkpoint families and a greedy runner.
 //! Oco encodes text and looks up markers; the protocol below belongs to the caller.
 #![allow(dead_code)]
-use anyhow::{Context, Result};
 use oco::{Tokenizer, Weights};
 use std::time::{Duration, Instant};
+
+/// A test's failure: oco's, I/O's, or the test's own message.
+pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub struct Tool {
     pub name: &'static str,
@@ -53,7 +55,7 @@ pub fn prompt(
     let special = |name: &str| {
         tokenizer
             .special_token(name)
-            .with_context(|| format!("missing {name}"))
+            .ok_or_else(|| format!("missing {name}"))
     };
     let mut tokens = Vec::new();
     match family(tokenizer) {

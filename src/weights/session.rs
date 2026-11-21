@@ -1,6 +1,6 @@
 use super::*;
+use crate::error::{Error, Result, bail, ensure};
 use crate::gpu::BufferView;
-use anyhow::{Result, anyhow, bail, ensure};
 use compute::{Bindings, Compute};
 use state::*;
 use std::{borrow::Cow, ops::Range};
@@ -71,7 +71,7 @@ impl Session {
     pub(super) fn new(weights: &Architecture, capacity: usize) -> Result<Self> {
         ensure!(
             capacity > 0 && capacity <= weights.base().context,
-            "invalid context capacity"
+            Error::Request("invalid context capacity")
         );
         let prefill_rows = capacity.min(MAX_PREFILL_ROWS);
         let inner = match weights {
@@ -133,17 +133,17 @@ impl Session {
     pub async fn embed_audio(&mut self, samples: &[f32]) -> Result<Vec<u32>> {
         self.position()?;
         let Execution::QwenAttention { weights, memory } = &self.inner else {
-            bail!("this model has no audio encoder");
+            bail!(Error::Request("this model has no audio encoder"));
         };
         let (Some(encoder), Some((scratch, features))) = (&weights.audio, &memory.audio) else {
-            bail!("this model has no audio encoder");
+            bail!(Error::Request("this model has no audio encoder"));
         };
         let windows = encoder.windows(samples)?;
         let total: usize = windows.iter().map(qwen::audio::Window::tokens).sum();
         let mut used = self.features;
         ensure!(
             total <= self.capacity - used,
-            "audio exceeds the session capacity"
+            Error::Request("audio exceeds the session capacity")
         );
         let vocabulary = self.vocabulary_size();
         let width = encoder.output * 2;
@@ -194,7 +194,9 @@ impl Session {
     /// Count the consumed tokens the GPU state already holds.
     fn resident(&self) -> Result<usize> {
         match self.progress {
-            Progress::Unusable => Err(anyhow!("session is unusable; create a new session")),
+            Progress::Unusable => Err(Error::Request(
+                "session is unusable; create a new session".into(),
+            )),
             Progress::Ready { resident } => Ok(resident),
         }
     }
@@ -230,9 +232,12 @@ impl Session {
         let position = self.resident()?;
         ensure!(
             position > 0 && position == self.history.len(),
-            "decode requires a prefilled session"
+            Error::Request("decode requires a prefilled session")
         );
-        ensure!(position < self.capacity, "context capacity exceeded");
+        ensure!(
+            position < self.capacity,
+            Error::Request("context capacity exceeded")
+        );
         self.progress = Progress::Unusable;
         self.forward(&self.common().1.next, position..position + 1, Some(0))
             .await?;
@@ -248,7 +253,7 @@ impl Session {
         let [selected] = selected;
         ensure!(
             (selected as usize) < self.vocabulary_size(),
-            "non-finite logits produced no valid token"
+            Error::Gpu("non-finite logits produced no valid token")
         );
         self.progress = Progress::Ready { resident: position };
         Ok(selected)
@@ -277,7 +282,7 @@ impl Session {
         let resident = self.resident()?;
         ensure!(
             position <= self.history.len(),
-            "cannot rewind past the consumed context"
+            Error::Request("cannot rewind past the consumed context")
         );
         self.history.truncate(position);
         self.checkpoints.retain(|c| c.position <= position);

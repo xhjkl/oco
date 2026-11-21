@@ -1,11 +1,11 @@
 use super::AttentionParams;
+use crate::Result;
 use crate::gpu::{
     Gpu, dispatch,
     tests::{buffer, read},
 };
 use crate::tensor::WeightFormat;
 use crate::weights::{compute::Compute, pipelines::Builder};
-use anyhow::Result;
 use half::{bf16, f16};
 
 /// Check the vector and tiled attention kernels against mathematical softmax at causal and

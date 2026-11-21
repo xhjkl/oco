@@ -1,6 +1,6 @@
 use super::Gpu;
+use crate::error::{Context, Error, Result, ensure};
 use crate::gpu::{Buffer, BufferRef};
-use anyhow::{Result, ensure};
 use block2::RcBlock;
 use bytemuck::Pod;
 use memmap2::Mmap;
@@ -166,11 +166,11 @@ impl MappedRegions {
             while let Some(&(offset, bytes)) = spans.get(index) {
                 ensure!(
                     offset <= map.len() && bytes <= map.len() - offset,
-                    "tensor outside mapped storage"
+                    Error::Gpu("tensor outside mapped storage")
                 );
                 let next = (offset + bytes)
                     .checked_next_multiple_of(page)
-                    .ok_or_else(|| anyhow::anyhow!("mapped range overflow"))?;
+                    .context(Error::Gpu, "mapped range overflow")?;
                 // Splitting at unused pages to limit registration size; this is a resource policy.
                 if offset / page * page > end || next - begin > limit {
                     break;
@@ -178,7 +178,10 @@ impl MappedRegions {
                 end = next;
                 index += 1;
             }
-            ensure!(end > begin, "tensor exceeds Metal's buffer limit");
+            ensure!(
+                end > begin,
+                Error::Gpu("tensor exceeds Metal's buffer limit")
+            );
             let storage = gpu.load(map, begin, (end - begin).min(map.len() - begin))?;
             regions.push((begin, storage));
         }
@@ -194,8 +197,7 @@ impl MappedRegions {
         let region = self.regions.iter().find(|(begin, s)| {
             offset >= *begin && offset - begin <= s.length && bytes <= s.length - (offset - begin)
         });
-        let (begin, s) =
-            region.ok_or_else(|| anyhow::anyhow!("tensor has no containing Metal region"))?;
+        let (begin, s) = region.context(Error::Gpu, "tensor has no containing Metal region")?;
         Ok(ReadOnly {
             buffer: s.buffer.clone(),
             offset: s.offset + offset - begin,
@@ -211,7 +213,7 @@ fn page_size() -> Result<usize> {
     let page = unsafe { getpagesize() };
     ensure!(
         page > 0 && (page as usize).is_power_of_two(),
-        "invalid host page size"
+        Error::Gpu("invalid host page size")
     );
     Ok(page as usize)
 }
@@ -243,30 +245,30 @@ impl Gpu {
     pub fn load(&self, mapping: &Arc<Mmap>, offset: usize, bytes: usize) -> Result<ReadOnly> {
         ensure!(
             offset <= mapping.len() && bytes <= mapping.len() - offset,
-            "buffer outside mapped storage"
+            Error::Gpu("buffer outside mapped storage")
         );
         let page = page_size()?;
         ensure!(
             (mapping.as_ptr() as usize).is_multiple_of(page),
-            "mmap base is not page aligned"
+            Error::Gpu("mmap base is not page aligned")
         );
         let begin = offset / page * page;
         let offset = offset - begin;
         let length = (offset + bytes)
             .checked_next_multiple_of(page)
-            .ok_or_else(|| anyhow::anyhow!("mapped range overflow"))?;
+            .context(Error::Gpu, "mapped range overflow")?;
         let mapped = mapping
             .len()
             .checked_next_multiple_of(page)
-            .ok_or_else(|| anyhow::anyhow!("mapped length overflow"))?;
+            .context(Error::Gpu, "mapped length overflow")?;
         // Including only the OS-mapped final partial page; logical tensor ranges remain inside the file.
         ensure!(
             begin <= mapped && length <= mapped - begin,
-            "buffer exceeds mapped pages"
+            Error::Gpu("buffer exceeds mapped pages")
         );
         ensure!(
             length <= self.device.maxBufferLength(),
-            "buffer exceeds Metal's buffer limit"
+            Error::Gpu("buffer exceeds Metal's buffer limit")
         );
         let pointer = unsafe { mapping.as_ptr().add(begin) };
         let mapping = mapping.clone();
@@ -283,7 +285,7 @@ impl Gpu {
                     Some(&deallocator),
                 )
         }
-        .ok_or_else(|| anyhow::anyhow!("Metal mapping registration failed"))?;
+        .context(Error::Gpu, "Metal mapping registration failed")?;
         // Sharing immutable mapped bytes; the deallocator owns their mapping.
         let buffer = unsafe { Retained::cast_unchecked(buffer) };
         self.weights.fetch_add(length, Ordering::Relaxed);

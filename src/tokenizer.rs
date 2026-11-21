@@ -1,5 +1,5 @@
+use crate::error::{Context, Error, Result, bail, ensure};
 use crate::gguf::Gguf;
-use anyhow::{Context, Result, bail, ensure};
 use tokenizers::{
     SplitDelimiterBehavior,
     models::bpe::{BPE, Vocab},
@@ -42,7 +42,7 @@ impl Tokenizer {
     pub(crate) fn load(file: &Gguf) -> Result<Self> {
         ensure!(
             file.text("tokenizer.ggml.model")? == "gpt2",
-            "unsupported tokenizer model"
+            Error::Checkpoint("unsupported tokenizer model")
         );
         let pre = file.text("tokenizer.ggml.pre")?;
         let pattern = match pre {
@@ -59,14 +59,16 @@ impl Tokenizer {
             "tekken" | "pixtral" => {
                 r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
-            _ => bail!("unsupported tokenizer preprocessor {pre}"),
+            _ => bail!(Error::Checkpoint(
+                "unsupported tokenizer preprocessor {pre}"
+            )),
         };
         let tokens = file.strings("tokenizer.ggml.tokens")?;
         let kinds = file.integers("tokenizer.ggml.token_type")?;
         let vocabulary = tokens.len();
         ensure!(
             kinds.len() == vocabulary,
-            "tokenizer token kinds do not match its vocabulary"
+            Error::Checkpoint("tokenizer token kinds do not match its vocabulary")
         );
         let kinds = kinds
             .into_iter()
@@ -78,34 +80,42 @@ impl Tokenizer {
                     4 => TokenKind::UserDefined,
                     5 => TokenKind::Unused,
                     6 => TokenKind::Byte,
-                    _ => bail!("invalid tokenizer token kind {kind}"),
+                    _ => bail!(Error::Checkpoint("invalid tokenizer token kind {kind}")),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         let mut vocab = Vocab::with_capacity(vocabulary);
         for (id, token) in tokens.into_iter().enumerate() {
-            ensure!(!token.is_empty(), "empty vocabulary token");
+            ensure!(
+                !token.is_empty(),
+                Error::Checkpoint("empty vocabulary token")
+            );
             let previous = vocab.insert(token.to_owned(), id as u32);
-            ensure!(previous.is_none(), "duplicate vocabulary token {token}");
+            ensure!(
+                previous.is_none(),
+                Error::Checkpoint("duplicate vocabulary token {token}")
+            );
         }
         // Requiring the complete byte alphabet; BPE otherwise silently drops unknown characters.
         for character in ByteLevel::alphabet() {
             let id = vocab
                 .get(&character.to_string())
-                .context("incomplete byte vocabulary")?;
+                .context(Error::Checkpoint, "incomplete byte vocabulary")?;
             ensure!(
                 kinds[*id as usize] == TokenKind::Normal,
-                "invalid byte vocabulary kind"
+                Error::Checkpoint("invalid byte vocabulary kind")
             );
         }
         let merges = file.strings("tokenizer.ggml.merges")?;
         let merges = merges
             .into_iter()
             .map(|merge| {
-                let (left, right) = merge.split_once(' ').context("invalid BPE merge")?;
+                let (left, right) = merge
+                    .split_once(' ')
+                    .context(Error::Checkpoint, "invalid BPE merge")?;
                 ensure!(
                     !left.is_empty() && !right.is_empty() && !right.contains(' '),
-                    "invalid BPE merge"
+                    Error::Checkpoint("invalid BPE merge")
                 );
                 Ok((left.to_owned(), right.to_owned()))
             })
@@ -115,29 +125,28 @@ impl Tokenizer {
         let model = BPE::builder()
             .vocab_and_merges(vocab, merges)
             .ignore_merges(whole_words)
-            .build()
-            .map_err(anyhow::Error::from_boxed)?;
+            .build()?;
         let split = Split::new(
             SplitPattern::Regex(pattern.to_owned()),
             SplitDelimiterBehavior::Isolated,
             false,
-        )
-        .map_err(anyhow::Error::from_boxed)?;
+        )?;
         let mut encoder = tokenizers::Tokenizer::new(model);
         encoder.with_pre_tokenizer(Some(Sequence::new(vec![
             split.into(),
             ByteLevel::new(false, false, false).into(),
         ])));
         if pre == "qwen35" {
-            encoder
-                .with_normalizer(Some(NFC))
-                .map_err(anyhow::Error::from_boxed)?;
+            encoder.with_normalizer(Some(NFC))?;
         }
         // Leaving added-token recognition disabled; callers insert control IDs explicitly.
         let boundary = |key| -> Result<Option<u32>> {
             let id = file.optional_unsigned(key)?;
             let Some(id) = id else { return Ok(None) };
-            ensure!(id < vocabulary as u64, "out-of-range {key}");
+            ensure!(
+                id < vocabulary as u64,
+                Error::Checkpoint("out-of-range {key}")
+            );
             Ok(Some(id as u32))
         };
         let bos = boundary("tokenizer.ggml.bos_token_id")?;
@@ -153,10 +162,7 @@ impl Tokenizer {
     /// Encode ordinary text without inserting BOS/EOS or recognizing control-token spellings.
     /// Qwen35 applies its tokenizer's NFC normalization.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoded = self
-            .encoder
-            .encode_fast(text, false)
-            .map_err(anyhow::Error::from_boxed)?;
+        let encoded = self.encoder.encode_fast(text, false)?;
         Ok(encoded.get_ids().to_vec())
     }
 
@@ -206,11 +212,13 @@ impl Tokenizer {
     }
 
     fn append_bytes(&self, id: u32, output: &mut Vec<u8>) -> Result<()> {
-        let kind = self.token_kind(id).context("token ID outside vocabulary")?;
+        let kind = self
+            .token_kind(id)
+            .context(Error::Request, "token ID outside vocabulary")?;
         let token = self
             .encoder
             .id_to_token(id)
-            .context("missing vocabulary token")?;
+            .context(Error::Checkpoint, "missing vocabulary token")?;
         match kind {
             TokenKind::Normal => {
                 for character in token.chars() {
@@ -220,7 +228,9 @@ impl Tokenizer {
                         c @ 256..=288 => (c - 256) as u8,
                         c @ 289..=322 => (c - 289 + 127) as u8,
                         323 => 173,
-                        _ => bail!("invalid byte-level vocabulary token {id}"),
+                        _ => bail!(Error::Checkpoint(
+                            "invalid byte-level vocabulary token {id}"
+                        )),
                     };
                     output.push(byte);
                 }
@@ -229,8 +239,9 @@ impl Tokenizer {
                 let hex = token
                     .strip_prefix("<0x")
                     .and_then(|s| s.strip_suffix('>'))
-                    .context("invalid byte token")?;
-                let byte = u8::from_str_radix(hex, 16)?;
+                    .context(Error::Checkpoint, "invalid byte token")?;
+                let byte =
+                    u8::from_str_radix(hex, 16).context(Error::Checkpoint, "invalid byte token")?;
                 output.push(byte);
             }
             _ => output.extend_from_slice(token.as_bytes()),
@@ -251,7 +262,10 @@ impl Decoder<'_> {
             match std::str::from_utf8(bytes) {
                 Err(error) => {
                     let valid = error.valid_up_to();
-                    text.push_str(std::str::from_utf8(&bytes[..valid])?);
+                    text.push_str(
+                        std::str::from_utf8(&bytes[..valid])
+                            .expect("UTF-8 up to the first invalid byte"),
+                    );
                     consumed += valid;
                     let Some(invalid) = error.error_len() else {
                         break;

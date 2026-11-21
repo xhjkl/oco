@@ -1,5 +1,5 @@
+use crate::error::{Result, ensure};
 use crate::gpu::ReadOnly;
-use anyhow::Result;
 
 /// Encodings used to read learned coefficients from the checkpoint inside Metal kernels.
 /// Quantized formats pack groups of coefficients with reconstruction data; their
@@ -46,9 +46,9 @@ pub struct Tensor {
 
 impl Tensor {
     pub fn bound(storage: ReadOnly, kind: WeightFormat, shape: &[usize]) -> Result<Self> {
-        anyhow::ensure!(
+        ensure!(
             !shape.is_empty() && shape.len() <= 3,
-            "unsupported runtime tensor geometry"
+            Error::Checkpoint("unsupported runtime tensor geometry")
         );
         let mut geometry = [1; 3];
         geometry[..shape.len()].copy_from_slice(shape);

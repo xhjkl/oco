@@ -8,6 +8,7 @@ use super::{
     delta::{Delta, QwenDelta},
     hybrid::{AttentionSlot, DeltaSlot, HybridMixer, QwenHybrid},
 };
+use crate::error::{Context, Error, Result, ensure};
 use crate::{
     gguf::Gguf,
     gpu::Gpu,
@@ -18,7 +19,6 @@ use crate::{
         load::{Geometry, Import, Parameters, Selection, common_selection, common_weights, import},
     },
 };
-use anyhow::{Context, Result, ensure};
 use std::sync::Arc;
 
 impl<'a> Selection<'a> {
@@ -242,7 +242,10 @@ fn delta_geometry(p: &Parameters<'_>) -> Result<DeltaGeometry> {
     let kh = p.integer("ssm.group_count")?;
     let vh = p.integer("ssm.time_step_rank")?;
     let inner = p.integer("ssm.inner_size")?;
-    ensure!(inner.is_multiple_of(vh), "invalid gated delta inner size");
+    ensure!(
+        inner.is_multiple_of(vh),
+        Error::Checkpoint("invalid gated delta inner size")
+    );
     let vd = inner / vh;
     let state = p.integer("ssm.state_size")?;
     let conv = p.integer("ssm.conv_kernel")?;
@@ -253,7 +256,7 @@ fn delta_geometry(p: &Parameters<'_>) -> Result<DeltaGeometry> {
             && vh <= 128
             && kh <= 128
             && vh.is_multiple_of(kh),
-        "unsupported gated delta geometry"
+        Error::Checkpoint("unsupported gated delta geometry")
     );
     let interval = p.integer("full_attention_interval")?;
     Ok(DeltaGeometry {
@@ -273,14 +276,17 @@ pub fn load(
 ) -> Result<Architecture> {
     p.scaling("none")?;
     let factor = p.optional("rope.scaling.factor", 1.0)?;
-    ensure!(factor == 1.0, "unsupported Qwen RoPE scaling factor");
+    ensure!(
+        factor == 1.0,
+        Error::Checkpoint("unsupported Qwen RoPE scaling factor")
+    );
     let (rope_dim, q_stride, ffn_norm) = match dialect {
         Dialect::Qwen35 => (p.integer("rope.dimension_count")?, 2, "post_attention_norm"),
         Dialect::Qwen3 => (g.dim, 1, "ffn_norm"),
     };
     ensure!(
         rope_dim <= g.dim && rope_dim.is_multiple_of(2),
-        "invalid RoPE dimensions"
+        Error::Checkpoint("invalid RoPE dimensions")
     );
     let delta = match dialect {
         Dialect::Qwen35 => Some(delta_geometry(p)?),
@@ -291,8 +297,8 @@ pub fn load(
     let mtp = file
         .optional_unsigned("qwen35.nextn_predict_layers")?
         .unwrap_or(0);
-    let mtp = usize::try_from(mtp).context("MTP layer count overflow")?;
-    ensure!(mtp < g.count, "invalid layer counts");
+    let mtp = usize::try_from(mtp).context(Error::Checkpoint, "MTP layer count overflow")?;
+    ensure!(mtp < g.count, Error::Checkpoint("invalid layer counts"));
     g.count -= mtp;
     let attention_count = g.count / interval;
     let delta_count = g.count - attention_count;
@@ -320,7 +326,7 @@ pub fn load(
     } else if attention_count == 0 {
         let d = delta
             .as_ref()
-            .context("gated delta layers need their geometry")?;
+            .context(Error::Checkpoint, "gated delta layers need their geometry")?;
         let layers = s.qwen_layers(&g, ffn_norm, |s, _, prefix| {
             s.delta(prefix, g.hidden, d.kh, d.vh, d.vd)
         })?;
@@ -328,7 +334,7 @@ pub fn load(
     } else {
         let d = delta
             .as_ref()
-            .context("gated delta layers need their geometry")?;
+            .context(Error::Checkpoint, "gated delta layers need their geometry")?;
         let mut attention_layers = 0;
         let mut delta_layers = 0;
         let layers = s.qwen_layers(&g, ffn_norm, |s, index, prefix| {
@@ -370,7 +376,7 @@ pub fn load(
     };
     ensure!(
         audio.is_none() || matches!(selected, selected::Qwen::Attention(_)),
-        "audio encoders attach only to dense attention models"
+        Error::Checkpoint("audio encoders attach only to dense attention models")
     );
     let inner = match selected {
         selected::Qwen::Attention(layers) => {
@@ -398,7 +404,7 @@ pub fn load(
             let recurrent = i.builder.recurrent()?;
             let d = delta
                 .as_ref()
-                .context("gated delta layers need their geometry")?;
+                .context(Error::Checkpoint, "gated delta layers need their geometry")?;
             let delta = DeltaPlan::new(d.kh, d.vh, d.vd, g.epsilon, recurrent);
             let layers = i.qwen_layers(layers, |i, weights| i.delta(weights))?;
             let residency = i.finish()?;
@@ -419,7 +425,7 @@ pub fn load(
             let recurrent = i.builder.recurrent()?;
             let d = delta
                 .as_ref()
-                .context("gated delta layers need their geometry")?;
+                .context(Error::Checkpoint, "gated delta layers need their geometry")?;
             let delta = DeltaPlan::new(d.kh, d.vh, d.vd, g.epsilon, recurrent);
             let attention = i.builder.attention(g.dim, g.context)?;
             let attention = AttentionPlan::new(rope, attention);

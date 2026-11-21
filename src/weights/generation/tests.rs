@@ -15,7 +15,7 @@ use crate::{
 use memmap2::MmapMut;
 use std::{pin::pin, sync::Arc};
 
-use anyhow::Result;
+use crate::Result;
 use futures_lite::{
     StreamExt,
     future::{block_on, poll_once},

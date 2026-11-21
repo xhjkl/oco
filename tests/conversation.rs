@@ -2,7 +2,7 @@
 //! well-formed tool call under its own protocol. Set QWEN_PATH, GPT_OSS_PATH, and
 //! NEMOTRON_PATH to GGUF files; tests without a path are skipped.
 mod common;
-use anyhow::Result;
+use common::Result;
 use common::{Family, WEATHER, family, generate, prompt};
 use std::sync::Mutex;
 

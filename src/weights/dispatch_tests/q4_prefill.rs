@@ -1,4 +1,5 @@
 use super::{dense_weights, half_operand, noise};
+use crate::Result;
 use crate::{
     gpu::{
         Gpu, Pipeline, dispatch,
@@ -7,7 +8,6 @@ use crate::{
     tensor::WeightFormat,
     weights::{compute::Compute, pipelines::Builder},
 };
-use anyhow::Result;
 use half::{bf16, f16};
 
 /// Check scaled half operands, bias, row-gain offsets and tile tails against FP64 products.

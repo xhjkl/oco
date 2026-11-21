@@ -6,8 +6,8 @@ use super::{
     operands::{ExpertWeight, Projection, Router},
     state::*,
 };
+use crate::Result;
 use crate::gpu::{ReadOnly, arena::Plan};
-use anyhow::Result;
 pub use load::load;
 use std::ops::Range;
 

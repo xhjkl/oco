@@ -8,10 +8,7 @@ fn decoder_preserves_split_utf8_controls_and_invalid_byte_boundaries() -> Result
         .map(|(id, c)| (c.to_string(), id as u32))
         .collect();
     vocab.insert("<|stop|>".to_owned(), 256);
-    let model = BPE::builder()
-        .vocab_and_merges(vocab, Vec::new())
-        .build()
-        .map_err(anyhow::Error::from_boxed)?;
+    let model = BPE::builder().vocab_and_merges(vocab, Vec::new()).build()?;
     let mut encoder = tokenizers::Tokenizer::new(model);
     encoder.with_pre_tokenizer(Some(ByteLevel::new(false, false, false)));
     let mut kinds = vec![TokenKind::Normal; 256];

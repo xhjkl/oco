@@ -1,10 +1,10 @@
 use super::{common::Kernels, compute::Norm};
+use crate::error::{Result, bail};
 use crate::gpu::Library;
 use crate::{
     gpu::{Gpu, Pipeline},
     tensor::WeightFormat,
 };
-use anyhow::{Result, bail};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTL4Compiler, MTL4CompilerDescriptor, MTLDevice};
 use std::collections::HashMap;
@@ -331,7 +331,7 @@ impl Builder {
             64 => "attention_vector_64",
             128 => "attention_vector_128",
             256 => "attention_vector_256",
-            _ => bail!("unsupported attention head width {dim}"),
+            _ => bail!(Error::Checkpoint("unsupported attention head width {dim}")),
         };
         let vector = self.get(vector, F32, 0)?;
         let tiled = if context >= 8 && dim == 64 {

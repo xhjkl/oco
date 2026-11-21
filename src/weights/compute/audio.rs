@@ -2,6 +2,7 @@
 //! normalization, GELU, positional tables, and unfolding strided convolutions into dense
 //! products. The caller owns the prepared kernels and the operands.
 use super::{AttentionPlan, Bindings};
+use crate::Result;
 use crate::gpu::{BufferRef, BufferView, Gpu, ReadOnly, dispatch};
 use crate::tensor::{Tensor, WeightFormat};
 use crate::weights::{
@@ -10,7 +11,6 @@ use crate::weights::{
     pipelines::{AudioPipelines, Builder},
     state::{AttentionScratch, Kv},
 };
-use anyhow::Result;
 use bytemuck::{Pod, Zeroable, bytes_of};
 
 /// Width and epsilon of one mean-centered normalization.

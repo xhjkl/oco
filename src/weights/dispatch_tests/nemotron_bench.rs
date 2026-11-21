@@ -1,8 +1,8 @@
 //! Throughput of the gathered expert kernels at Nemotron's prefill shape. Ignored by default:
 //! `cargo test --release --lib expert_kernel_throughput -- --ignored --nocapture`.
+use crate::Result;
 use crate::gpu::{Gpu, dispatch, dispatch_indirect, tests::buffer};
 use crate::weights::{compute::Compute, pipelines::Builder};
-use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use std::time::Instant;
 

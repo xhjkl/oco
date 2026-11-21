@@ -1,5 +1,5 @@
 use super::{Gguf, Reader};
-use anyhow::Result;
+use crate::Result;
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},

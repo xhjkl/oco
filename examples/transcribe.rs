@@ -1,7 +1,7 @@
 //! Transcribe a 16 kHz mono WAV file with Whisper or Qwen3-ASR.
 //! Usage: transcribe ggml-whisper.bin AUDIO.wav [LANGUAGE]
 //!        transcribe QWEN3-ASR.gguf MMPROJ.gguf AUDIO.wav
-use anyhow::{Context, Result, ensure};
+use std::error::Error;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
@@ -10,23 +10,31 @@ use std::time::Instant;
 const USAGE: &str = "usage: transcribe ggml-whisper.bin AUDIO.wav [LANGUAGE] | transcribe MODEL.gguf MMPROJ.gguf AUDIO.wav";
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    ensure!((2..=3).contains(&args.len()), "{USAGE}");
+    if !(2..=3).contains(&args.len()) {
+        return Err(USAGE.into());
+    }
     let is_gguf = |path: &OsString| Path::new(path).extension().is_some_and(|e| e == "gguf");
     if is_gguf(&args[0]) {
-        ensure!(args.len() == 3, "{USAGE}");
+        if args.len() != 3 {
+            return Err(USAGE.into());
+        }
         qwen(&args[0], &args[1], &args[2]).await
     } else {
         let language = args
             .get(2)
-            .map(|l| l.to_str().context("language must be UTF-8"))
+            .map(|l| l.to_str().ok_or("language must be UTF-8"))
             .transpose()?;
         whisper(&args[0], &args[1], language).await
     }
 }
 
-async fn whisper(model: &OsString, wav: &OsString, language: Option<&str>) -> Result<()> {
+async fn whisper(
+    model: &OsString,
+    wav: &OsString,
+    language: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let samples = oco::audio::wav_samples(&std::fs::read(wav)?)?;
     let loading = Instant::now();
     let whisper = oco::Whisper::load(model)?;
@@ -52,14 +60,14 @@ async fn whisper(model: &OsString, wav: &OsString, language: Option<&str>) -> Re
     Ok(())
 }
 
-async fn qwen(text: &OsString, audio: &OsString, wav: &OsString) -> Result<()> {
+async fn qwen(text: &OsString, audio: &OsString, wav: &OsString) -> Result<(), Box<dyn Error>> {
     let samples = oco::audio::wav_samples(&std::fs::read(wav)?)?;
     let weights = oco::load_asr(text, audio)?;
     let tokenizer = weights.tokenizer();
     let special = |name: &str| {
         tokenizer
             .special_token(name)
-            .with_context(|| format!("missing {name}"))
+            .ok_or_else(|| format!("missing {name}"))
     };
     let mut session = weights.new_session(2048.min(weights.context_limit()))?;
     let started = Instant::now();

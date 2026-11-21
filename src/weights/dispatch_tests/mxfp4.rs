@@ -1,4 +1,5 @@
 use super::{GUARD, SENTINEL, noise};
+use crate::Result;
 use crate::{
     gpu::{
         Gpu, dispatch, dispatch_indirect,
@@ -9,7 +10,6 @@ use crate::{
         pipelines::{Builder, ExpertPipelines},
     },
 };
-use anyhow::Result;
 use half::{bf16, f16};
 
 // Unaligned GGUF blocks exercise byte-addressed E8M0 scales and paired E2M1 nibbles.

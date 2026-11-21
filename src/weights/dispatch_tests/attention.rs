@@ -1,4 +1,5 @@
 use super::GUARD;
+use crate::Result;
 use crate::weights::compute::AttentionParams;
 use crate::{
     gpu::{
@@ -11,7 +12,6 @@ use crate::{
         pipelines::Builder,
     },
 };
-use anyhow::Result;
 use half::{bf16, f16};
 
 #[path = "attention_wide.rs"]

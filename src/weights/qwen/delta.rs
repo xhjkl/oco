@@ -1,5 +1,6 @@
 //! Homogeneous Qwen gated-delta layers and their recurrent history.
 use super::QwenLayer;
+use crate::Result;
 use crate::gpu::{ReadOnly, arena::Plan};
 use crate::weights::{
     common::CommonWeights,
@@ -7,7 +8,6 @@ use crate::weights::{
     operands::Projection,
     state::*,
 };
-use anyhow::Result;
 use std::ops::Range;
 
 pub const KEY_WIDTH: usize = 128;

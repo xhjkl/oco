@@ -3,7 +3,7 @@
 //! so transcripts match those references: periodic Hann window, 400-point FFT, power spectrum,
 //! Slaney-normalized triangular filters, log10, then clamping to eight decades below the peak
 //! and rescaling into roughly [-1, 1].
-use anyhow::{Context, Result, ensure};
+use crate::error::{Context, Error, Result, bail, ensure};
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const FFT_SIZE: usize = 400;
@@ -24,7 +24,7 @@ impl MelFilters {
     pub fn new(mels: usize, weights: Vec<f32>) -> Result<Self> {
         ensure!(
             mels > 0 && weights.len() == mels * BINS,
-            "mel filter bank does not match {BINS} spectrum bins"
+            Error::Checkpoint("mel filter bank does not match {BINS} spectrum bins")
         );
         Ok(Self { mels, weights })
     }
@@ -98,7 +98,7 @@ impl Spectrogram {
 /// silence, so every 30-second window read from it is complete.
 pub fn whisper_log_mel(samples: &[f32], filters: &MelFilters) -> Result<Spectrogram> {
     const FLOOR: f64 = 1e-10;
-    ensure!(!samples.is_empty(), "no audio samples");
+    ensure!(!samples.is_empty(), Error::Audio("no audio samples"));
     let half = FFT_SIZE / 2;
     let mut padded = Vec::with_capacity(samples.len() + 30 * SAMPLE_RATE + 2 * half);
     let reflect = half.min(samples.len() - 1);
@@ -118,7 +118,7 @@ pub fn centered_log_mel(samples: &[f32], filters: &MelFilters) -> Result<Spectro
     const FLOOR: f64 = 5.960_464_477_539_063e-8;
     ensure!(
         samples.len() > FFT_SIZE / 2,
-        "audio shorter than one analysis window"
+        Error::Audio("audio shorter than one analysis window")
     );
     let half = FFT_SIZE / 2;
     let mut padded = Vec::with_capacity(samples.len() + 2 * half);
@@ -297,14 +297,18 @@ impl Frame {
 pub fn wav_samples(bytes: &[u8]) -> Result<Vec<f32>> {
     ensure!(
         bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
-        "not a RIFF WAVE file"
+        Error::Audio("not a RIFF WAVE file")
     );
     let u16_at = |at: usize| -> Result<u16> {
-        let b = bytes.get(at..at + 2).context("truncated WAV header")?;
+        let b = bytes
+            .get(at..at + 2)
+            .context(Error::Audio, "truncated WAV header")?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
     };
     let u32_at = |at: usize| -> Result<u32> {
-        let b = bytes.get(at..at + 4).context("truncated WAV header")?;
+        let b = bytes
+            .get(at..at + 4)
+            .context(Error::Audio, "truncated WAV header")?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
     let mut format = None;
@@ -313,23 +317,26 @@ pub fn wav_samples(bytes: &[u8]) -> Result<Vec<f32>> {
         let id = &bytes[cursor..cursor + 4];
         let size = u32_at(cursor + 4)? as usize;
         let body = cursor + 8;
-        ensure!(body + size <= bytes.len(), "truncated WAV chunk");
+        ensure!(
+            body + size <= bytes.len(),
+            Error::Audio("truncated WAV chunk")
+        );
         match id {
             b"fmt " => {
                 let tag = u16_at(body)?;
                 let channels = u16_at(body + 2)? as usize;
                 let rate = u32_at(body + 4)? as usize;
                 let bits = u16_at(body + 14)? as usize;
-                ensure!(channels > 0, "WAV without channels");
+                ensure!(channels > 0, Error::Audio("WAV without channels"));
                 ensure!(
                     rate == SAMPLE_RATE,
-                    "WAV sample rate {rate} Hz; resample to {SAMPLE_RATE} Hz"
+                    Error::Audio("WAV sample rate {rate} Hz; resample to {SAMPLE_RATE} Hz")
                 );
                 format = Some((tag, channels, bits));
             }
             b"data" => {
                 let (tag, channels, bits) =
-                    format.context("WAV data chunk before its format chunk")?;
+                    format.context(Error::Audio, "WAV data chunk before its format chunk")?;
                 let data = &bytes[body..body + size];
                 let samples: Vec<f32> = match (tag, bits) {
                     (1, 16) => data
@@ -344,7 +351,9 @@ pub fn wav_samples(bytes: &[u8]) -> Result<Vec<f32>> {
                         .iter()
                         .map(|&b| f32::from_le_bytes(b))
                         .collect(),
-                    _ => anyhow::bail!("unsupported WAV encoding (format {tag}, {bits} bits)"),
+                    _ => bail!(Error::Audio(
+                        "unsupported WAV encoding (format {tag}, {bits} bits)"
+                    )),
                 };
                 return Ok(samples
                     .chunks_exact(channels)
@@ -355,7 +364,7 @@ pub fn wav_samples(bytes: &[u8]) -> Result<Vec<f32>> {
         }
         cursor = body + size + (size & 1);
     }
-    anyhow::bail!("WAV without a data chunk")
+    bail!(Error::Audio("WAV without a data chunk"))
 }
 
 #[cfg(test)]

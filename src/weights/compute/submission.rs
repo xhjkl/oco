@@ -1,6 +1,6 @@
 use super::Compute;
+use crate::error::{Context, Error, Result, bail};
 use crate::gpu::{CommandMemory, Commands};
-use anyhow::{Result, anyhow};
 use block2::RcBlock;
 use futures_channel::oneshot;
 use objc2::runtime::ProtocolObject;
@@ -34,8 +34,7 @@ impl Compute {
             };
             memory.begin();
             let encoder = memory.command.computeCommandEncoder();
-            let encoder =
-                encoder.ok_or_else(|| anyhow!("Metal compute encoder creation failed"))?;
+            let encoder = encoder.context(Error::Gpu, "Metal compute encoder creation failed")?;
             // Preserving queue order across submissions as well as dependencies within each pass.
             encoder.barrierAfterQueueStages_beforeStages_visibilityOptions(
                 MTLStages::Dispatch,
@@ -72,7 +71,7 @@ impl Compute {
                         let error = unsafe { feedback.as_ref() }.error();
                         drop(queue);
                         if let Some(error) = error {
-                            return Err(anyhow!("Metal command failed: {error}"));
+                            bail!(Error::Gpu("Metal command failed: {error}"));
                         }
                         let mut memory = memory;
                         memory.resolve_profile();
@@ -85,7 +84,7 @@ impl Compute {
                         Ok(())
                     }));
                     let result = match result {
-                        Err(_) => Err(anyhow!("Metal completion handler panicked")),
+                        Err(_) => Err(Error::Gpu("Metal completion handler panicked".into())),
                         Ok(result) => result,
                     };
                     let _ = catch_unwind(AssertUnwindSafe(|| sender.send(result)));
@@ -103,7 +102,7 @@ impl Compute {
         async move {
             completed?
                 .await
-                .map_err(|_| anyhow!("Metal completion handler was dropped"))?
+                .map_err(|_| Error::Gpu("Metal completion handler was dropped".into()))?
         }
     }
 }

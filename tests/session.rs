@@ -2,7 +2,7 @@
 //! a fresh session fed the same IDs. Set QWEN_PATH, GPT_OSS_PATH, and NEMOTRON_PATH to GGUF
 //! files; tests without a path are skipped.
 mod common;
-use anyhow::{Context, Result};
+use common::Result;
 use common::{Family, WEATHER, family, prompt};
 use oco::{Session, Weights};
 use std::{sync::Mutex, time::Instant};
@@ -72,7 +72,7 @@ fn reuse(variable: &str) -> Result<()> {
         let mut session = weights.new_session(capacity)?;
         let first = {
             let mut inference = session.infer(preamble)?;
-            inference.next().await?.context("no prediction")?
+            inference.next().await?.ok_or("no prediction")?
         };
         assert_eq!(session.history(), preamble);
         let started = Instant::now();
@@ -96,7 +96,7 @@ fn reuse(variable: &str) -> Result<()> {
         // Continuing through the first prediction matches plain decoding.
         let mut continued = weights.new_session(capacity)?;
         let mut inference = continued.infer(&ids)?;
-        let head = inference.next().await?.context("no prediction")?;
+        let head = inference.next().await?.ok_or("no prediction")?;
         drop(inference);
         continued.checkpoint()?;
         let rest = generate(&mut continued, &[head]).await?;
@@ -163,7 +163,7 @@ fn reuse(variable: &str) -> Result<()> {
         let mut many = weights.open_session(&file, capacity)?;
         for range in [0..8, 8..16, 16..TAIL] {
             let mut inference = many.infer(&tail[range])?;
-            inference.next().await?.context("no prediction")?;
+            inference.next().await?.ok_or("no prediction")?;
             drop(inference);
             many.checkpoint()?;
         }
@@ -186,7 +186,7 @@ fn reuse(variable: &str) -> Result<()> {
         assert!(weights.open_session(&file, capacity).is_err());
         std::fs::remove_file(&file)?;
         assert!(weights.open_session(&file, capacity).is_err());
-        anyhow::Ok(())
+        Result::Ok(())
     })?;
     check_capacity(&weights)
 }
@@ -206,7 +206,7 @@ fn check_capacity(weights: &Weights) -> Result<()> {
         assert!(weights.open_session(&file, consumed - 1).is_err());
         assert!(weights.open_session(&file, consumed).is_ok());
         std::fs::remove_file(&file)?;
-        anyhow::Ok(())
+        Result::Ok(())
     })
 }
 
@@ -215,7 +215,7 @@ async fn generate(session: &mut Session, input: &[u32]) -> Result<Vec<u32>> {
     let mut inference = session.infer(input)?;
     let mut tokens = Vec::with_capacity(GENERATED);
     while tokens.len() < GENERATED {
-        tokens.push(inference.next().await?.context("stream ended early")?);
+        tokens.push(inference.next().await?.ok_or("stream ended early")?);
     }
     Ok(tokens)
 }

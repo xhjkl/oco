@@ -1,8 +1,10 @@
 //! Streaming, continuation, and reset for each checkpoint. Set QWEN_PATH, GPT_OSS_PATH, and
 //! NEMOTRON_PATH to GGUF files; tests without a path are skipped.
-use anyhow::{Context, Result};
 use futures_lite::StreamExt;
 use std::{sync::Mutex, time::Instant};
+
+/// A test's failure: oco's, I/O's, or the test's own message.
+type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 // These models do not fit in GPU memory together, even when the test harness runs in parallel.
 static GPU: Mutex<()> = Mutex::new(());
@@ -52,7 +54,7 @@ fn infer(variable: &str, input: &[u32]) -> Result<()> {
         output.push_str(&decoder.finish());
         assert_eq!(output, text);
     }
-    let eos = tokenizer.eos_token().context("missing EOS")?;
+    let eos = tokenizer.eos_token().ok_or("missing EOS")?;
     assert!((eos as usize) < vocabulary);
     assert_eq!(
         tokenizer.special_token(&tokenizer.decode(&[eos])?),
@@ -65,7 +67,7 @@ fn infer(variable: &str, input: &[u32]) -> Result<()> {
         let mut output = Vec::with_capacity(128);
         let mut inference = session.infer(input)?;
         for _ in 0..64 {
-            let token = inference.next().await?.context("stream ended early")?;
+            let token = inference.next().await?.ok_or("stream ended early")?;
             output.push(token);
         }
         drop(inference);
@@ -77,7 +79,7 @@ fn infer(variable: &str, input: &[u32]) -> Result<()> {
             while let Some(token) = tokens.next().await {
                 output.push(token?);
             }
-            anyhow::Ok(())
+            Result::Ok(())
         };
         let ((), result) = tokio::join!(produce, consume);
         result?;
@@ -105,7 +107,7 @@ fn infer(variable: &str, input: &[u32]) -> Result<()> {
             Some(output[0]),
             "reset retained stale sequence state"
         );
-        anyhow::Ok(())
+        Result::Ok(())
     })?;
     drop(session);
     drop(weights);

@@ -1,9 +1,11 @@
 //! Speech recognition acceptance on the JFK sample: Whisper (whisper.cpp ggml checkpoint) and
 //! Qwen3-ASR (text GGUF plus audio encoder GGUF) must both produce the famous sentence.
 //! Set WHISPER_PATH, and QWEN3_ASR_PATH with QWEN3_ASR_MMPROJ; tests without paths are skipped.
-use anyhow::{Context, Result};
 use std::sync::Mutex;
 use std::time::Instant;
+
+/// A test's failure: oco's, I/O's, or the test's own message.
+type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 static GPU: Mutex<()> = Mutex::new(());
 
@@ -20,7 +22,7 @@ const EXPECTED: [&str; 8] = [
 
 fn samples() -> Result<Vec<f32>> {
     let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/jfk.wav"))?;
-    oco::audio::wav_samples(&bytes)
+    Ok(oco::audio::wav_samples(&bytes)?)
 }
 
 fn check(text: &str) {
@@ -94,7 +96,7 @@ fn qwen3_asr_transcribes_jfk() -> Result<()> {
     let special = |name: &str| {
         tokenizer
             .special_token(name)
-            .with_context(|| format!("missing {name}"))
+            .ok_or_else(|| format!("missing {name}"))
     };
     let mut session = weights.new_session(1024)?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
@@ -135,7 +137,7 @@ fn qwen3_asr_transcribes_jfk() -> Result<()> {
             }
             generated.push(token);
         }
-        anyhow::Ok(())
+        Result::Ok(())
     })?;
     let text = tokenizer.decode(&generated)?;
     eprintln!(
@@ -144,7 +146,7 @@ fn qwen3_asr_transcribes_jfk() -> Result<()> {
     );
     let (header, transcript) = text
         .split_once("<asr_text>")
-        .context("missing <asr_text> marker")?;
+        .ok_or("missing <asr_text> marker")?;
     assert!(header.contains("English"), "unexpected header {header:?}");
     check(transcript);
     // Resetting forgets the audio rows along with the conversation.

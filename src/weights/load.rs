@@ -13,13 +13,13 @@ use super::{
     pipelines::{Builder, ElementwisePipelines},
     qwen,
 };
+use crate::error::{Context, Error, Result, bail, ensure};
 use crate::{
     Tokenizer,
     gguf::{self, Gguf},
     gpu::{Gpu, MappedRegions, ReadOnly},
     tensor::{Tensor, WeightFormat},
 };
-use anyhow::{Context, Result, bail, ensure};
 use std::{collections::HashMap, sync::Arc};
 
 /// Checkpoint dimensions and numerical parameters used to validate weights and prepare execution.
@@ -54,8 +54,7 @@ impl<'a> Parameters<'a> {
         let n = self.number(key)?;
         ensure!(
             n > 0.0 && n <= u32::MAX as f64 && n.fract() == 0.0,
-            "invalid positive integer {}.{key}",
-            self.prefix
+            Error::Checkpoint("invalid positive integer {}.{key}", self.prefix)
         );
         Ok(n as usize)
     }
@@ -72,7 +71,10 @@ impl<'a> Parameters<'a> {
         let key = format!("{}.rope.scaling.type", self.prefix);
         if self.file.meta.contains_key(&key) {
             let value = self.file.text(&key)?;
-            ensure!(value == supported, "unsupported RoPE scaling {value}");
+            ensure!(
+                value == supported,
+                Error::Checkpoint("unsupported RoPE scaling {value}")
+            );
         }
         Ok(())
     }
@@ -89,25 +91,25 @@ impl<'a> Parameters<'a> {
         let count = self.integer("block_count")?;
         ensure!(
             hidden <= 16384 && ffn_width <= 65536 && heads <= 128 && kv <= 128,
-            "model geometry exceeds the supported kernel range"
+            Error::Checkpoint("model geometry exceeds the supported kernel range")
         );
         ensure!(
             hidden.is_multiple_of(128) || hidden == 2880,
-            "unsupported hidden dimension {hidden}"
+            Error::Checkpoint("unsupported hidden dimension {hidden}")
         );
         ensure!(
             ffn_width.is_multiple_of(64),
-            "feed-forward dimension must be divisible by 64"
+            Error::Checkpoint("feed-forward dimension must be divisible by 64")
         );
         ensure!(
             matches!(dim, 64 | 128 | 256) && heads.is_multiple_of(kv),
-            "unsupported attention geometry"
+            Error::Checkpoint("unsupported attention geometry")
         );
         ensure!(
             epsilon.is_finite() && epsilon > 0.0 && base.is_finite() && base > 1.0,
-            "invalid normalization or RoPE parameters"
+            Error::Checkpoint("invalid normalization or RoPE parameters")
         );
-        ensure!(count <= 128, "unsupported layer count");
+        ensure!(count <= 128, Error::Checkpoint("unsupported layer count"));
         Ok(Geometry {
             hidden,
             heads,
@@ -139,7 +141,7 @@ impl<'a> Selection<'a> {
 
     pub fn tensor(&mut self, name: &str) -> Result<gguf::Tensor<'a>> {
         let tensor = self.optional_tensor(name)?;
-        tensor.with_context(|| format!("missing tensor {name}"))
+        tensor.with_context(Error::Checkpoint, || format!("missing tensor {name}"))
     }
 
     fn optional_tensor(&mut self, name: &str) -> Result<Option<gguf::Tensor<'a>>> {
@@ -148,13 +150,16 @@ impl<'a> Selection<'a> {
         };
         let tensor = entry
             .select()
-            .with_context(|| format!("invalid tensor {name}"))?;
+            .with_context(Error::Checkpoint, || format!("invalid tensor {name}"))?;
         ensure!(
             tensor.shape.len() <= 3,
-            "unsupported runtime tensor geometry for {name}"
+            Error::Checkpoint("unsupported runtime tensor geometry for {name}")
         );
         let previous = self.spans.insert(tensor.offset, tensor.bytes);
-        ensure!(previous.is_none(), "duplicate selected operand {name}");
+        ensure!(
+            previous.is_none(),
+            Error::Checkpoint("duplicate selected operand {name}")
+        );
         Ok(Some(tensor))
     }
 
@@ -162,7 +167,7 @@ impl<'a> Selection<'a> {
         let t = self.tensor(name)?;
         ensure!(
             t.kind == WeightFormat::F32 && t.shape == shape,
-            "invalid float tensor {name}"
+            Error::Checkpoint("invalid float tensor {name}")
         );
         Ok(t)
     }
@@ -171,11 +176,11 @@ impl<'a> Selection<'a> {
         let t = self.tensor(&format!("{name}.weight"))?;
         ensure!(
             input.is_multiple_of(64) && t.shape == [input, output],
-            "unexpected matrix shape for {name}"
+            Error::Checkpoint("unexpected matrix shape for {name}")
         );
         ensure!(
             t.kind != WeightFormat::Mxfp4,
-            "MXFP4 is only supported for expert coefficients"
+            Error::Checkpoint("MXFP4 is only supported for expert coefficients")
         );
         Ok(t)
     }
@@ -202,7 +207,7 @@ impl<'a> Selection<'a> {
         if let Some(bias) = &bias {
             ensure!(
                 bias.kind == WeightFormat::F32 && bias.shape == [output],
-                "invalid float tensor {name}.bias"
+                Error::Checkpoint("invalid float tensor {name}.bias")
             );
         }
         Ok(selected::Projection { matrix, bias })
@@ -229,8 +234,7 @@ impl Import {
         let bytes = self.spans.remove(&t.offset);
         ensure!(
             bytes == Some(t.bytes),
-            "unselected or already bound operand at byte {}",
-            t.offset
+            Error::Checkpoint("unselected or already bound operand at byte {}", t.offset)
         );
         self.regions.get(t.offset, t.bytes)
     }
@@ -267,8 +271,7 @@ impl Import {
     pub fn finish(self) -> Result<std::sync::Arc<crate::gpu::ResidentWeights>> {
         ensure!(
             self.spans.is_empty(),
-            "{} unbound selected operands",
-            self.spans.len()
+            Error::Checkpoint("{} unbound selected operands", self.spans.len())
         );
         Ok(self.regions.residency)
     }
@@ -284,7 +287,7 @@ pub(crate) fn load(file: &Gguf, audio: Option<&Gguf>) -> Result<Weights> {
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
         ensure!(
             tokenizer.vocabulary() == inner.base().embedding.vocabulary,
-            "tokenizer vocabulary does not match model weights"
+            Error::Checkpoint("tokenizer vocabulary does not match model weights")
         );
         Ok(Weights {
             inner,
@@ -306,13 +309,15 @@ fn architecture(file: &Gguf, audio: Option<&Gguf>) -> Result<super::Architecture
             let g = p.geometry()?;
             qwen::load(file, &p, g, qwen::Dialect::Qwen3, audio)?
         }
-        _ if audio.is_some() => bail!("{prefix} does not accept an audio encoder"),
+        _ if audio.is_some() => bail!(Error::Checkpoint(
+            "{prefix} does not accept an audio encoder"
+        )),
         "gpt-oss" => {
             let g = p.geometry()?;
             gpt_oss::load(file, &p, g)?
         }
         "nemotron_h_moe" => nemotron::load(file, &p)?,
-        _ => bail!("unsupported architecture {prefix}"),
+        _ => bail!(Error::Checkpoint("unsupported architecture {prefix}")),
     })
 }
 
@@ -327,12 +332,12 @@ pub fn common_selection<'a>(
             && embedding.shape.len() == 2
             && embedding.shape[0] == g.hidden
             && embedding.kind != WeightFormat::Mxfp4,
-        "invalid embedding table"
+        Error::Checkpoint("invalid embedding table")
     );
     let vocabulary = embedding.shape[1];
     ensure!(
         !directory.contains_key("token_embd.bias"),
-        "token_embd.bias is unsupported by embedding lookup"
+        Error::Checkpoint("token_embd.bias is unsupported by embedding lookup")
     );
     // Checkpoints with tied word embeddings omit the output matrix and reuse the lookup table.
     let output = if directory.contains_key("output.weight") {
@@ -340,7 +345,7 @@ pub fn common_selection<'a>(
     } else {
         ensure!(
             !directory.contains_key("output.bias"),
-            "output.bias without output.weight"
+            Error::Checkpoint("output.bias without output.weight")
         );
         None
     };

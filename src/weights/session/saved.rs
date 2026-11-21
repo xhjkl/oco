@@ -5,11 +5,11 @@
 //! all in layer order. Files carry no identity: the caller names them by the weights, build,
 //! and IDs that produced them, and a file opened for anything else restores garbage.
 use super::{Architecture, Checkpoint, Progress, Session};
+use crate::error::{Context, Error, Result, ensure};
 use crate::gpu::BufferView;
-use anyhow::{Context, Result, ensure};
 use std::{
     fs::{File, OpenOptions},
-    io::{BufWriter, Read, Write},
+    io::{BufWriter, IntoInnerError, Read, Write},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -26,10 +26,12 @@ impl Session {
         let vocabulary = self.vocabulary_size();
         ensure!(
             self.history.iter().all(|&t| (t as usize) < vocabulary),
-            "contexts with spliced audio cannot be saved"
+            Error::Request("contexts with spliced audio cannot be saved")
         );
         let path = path.as_ref();
-        let name = path.file_name().context("context path has no file name")?;
+        let name = path
+            .file_name()
+            .context(Error::Request, "context path has no file name")?;
         let mut temporary = name.to_owned();
         let save = SAVES.fetch_add(1, Ordering::Relaxed);
         temporary.push(format!(".{}.{save}.tmp", std::process::id()));
@@ -58,7 +60,9 @@ impl Session {
             view.store(view.length(), &mut file)?;
         }
         // Syncing before the rename so a crash cannot leave a complete-looking torn file.
-        file.into_inner()?.sync_all()?;
+        file.into_inner()
+            .map_err(IntoInnerError::into_error)?
+            .sync_all()?;
         Ok(())
     }
 
@@ -73,13 +77,14 @@ impl Session {
         let mut count = || -> Result<usize> {
             let mut bytes = [0; 8];
             file.read_exact(&mut bytes)?;
-            Ok(usize::try_from(u64::from_le_bytes(bytes))?)
+            usize::try_from(u64::from_le_bytes(bytes))
+                .context(Error::Request, "saved context exceeds the session capacity")
         };
         let (consumed, resident) = (count()?, count()?);
         // Trusting the file everywhere except where it could overrun the session's buffers.
         ensure!(
             resident <= consumed && consumed <= capacity,
-            "saved context exceeds the session capacity"
+            Error::Request("saved context exceeds the session capacity")
         );
         let rows = resident * session.kv_row_bytes();
         let state: usize = session.recurrent_views().map(BufferView::length).sum();

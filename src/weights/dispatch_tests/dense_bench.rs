@@ -1,10 +1,10 @@
 //! Kernel timings at checkpoint shapes, for choosing dispatch thresholds. Ignored by default:
 //! `cargo test --release --lib dense_bench -- --ignored --nocapture --test-threads=1`.
+use crate::Result;
 use crate::gpu::{Buffer, Gpu, Pipeline, dispatch, tests::buffer};
 use crate::tensor::WeightFormat;
 use crate::weights::compute::AttentionParams;
 use crate::weights::{compute::Compute, pipelines::Builder};
-use anyhow::Result;
 use std::time::Instant;
 
 /// Best per-dispatch time of `iterations` ordered launches in one submission.

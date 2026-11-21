@@ -6,7 +6,7 @@ pub(crate) mod profile;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use anyhow::{Result, anyhow, ensure};
+use crate::error::{Context, Error, Result, ensure};
 pub use buffer::{BufferView, MappedRegions, ReadOnly};
 pub use dispatch::{CommandMemory, Commands, dispatch, dispatch_concurrent, dispatch_indirect};
 use dispatch2::DispatchData;
@@ -40,9 +40,9 @@ pub struct Gpu {
 impl Gpu {
     pub fn new() -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice();
-        let device = device.ok_or_else(|| anyhow!("a Metal GPU is required"))?;
+        let device = device.context(Error::Gpu, "a Metal GPU is required")?;
         let supported = device.supportsFamily(MTLGPUFamily::Metal4);
-        ensure!(supported, "a Metal 4 GPU is required");
+        ensure!(supported, Error::Gpu("a Metal 4 GPU is required"));
         Ok(Self {
             device,
             weights: AtomicUsize::new(0),

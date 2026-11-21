@@ -1,6 +1,7 @@
 //! Validate Nemotron-H MoE weights and per-layer topology before binding its concrete model.
 mod selected;
 use super::{Mamba, Mixer, Nemotron, NemotronLayer, ReluExperts};
+use crate::error::{Context, Error, Result, ensure};
 use crate::{
     gguf::Gguf,
     gpu::Gpu,
@@ -13,7 +14,6 @@ use crate::{
         operands::{DenseMatrix, DensePlan, Projection, Router},
     },
 };
-use anyhow::{Context, Result, ensure};
 use std::sync::Arc;
 
 const PREFIX: &str = "nemotron_h_moe";
@@ -98,18 +98,18 @@ impl<'a> Selection<'a> {
         let router = self.matrix(&format!("{prefix}.ffn_gate_inp"), g.hidden, t.experts)?;
         ensure!(
             router.kind == WeightFormat::F32,
-            "router weights must be float32"
+            Error::Checkpoint("router weights must be float32")
         );
         let router_bias = self.float(&format!("{prefix}.exp_probs_b.bias"), &[t.experts])?;
         let up = self.tensor(&format!("{prefix}.ffn_up_exps.weight"))?;
         ensure!(
             up.shape == [g.hidden, t.expert_width, t.experts] && up.kind == WeightFormat::Q4_0,
-            "unsupported expert up coefficients in {prefix}"
+            Error::Checkpoint("unsupported expert up coefficients in {prefix}")
         );
         let down = self.tensor(&format!("{prefix}.ffn_down_exps.weight"))?;
         ensure!(
             down.shape == [t.expert_width, g.hidden, t.experts] && down.kind == WeightFormat::Q4_0,
-            "unsupported expert down coefficients in {prefix}"
+            Error::Checkpoint("unsupported expert down coefficients in {prefix}")
         );
         let shared_up = self.projection_with_optional_bias(
             &format!("{prefix}.ffn_up_shexp"),
@@ -227,7 +227,10 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
     let heads = p.integer("attention.head_count")?;
     let dim = p.integer("attention.key_length")?;
     let value_dim = p.optional("attention.value_length", dim as f64)?;
-    ensure!(value_dim == dim as f64, "key and value widths must match");
+    ensure!(
+        value_dim == dim as f64,
+        Error::Checkpoint("key and value widths must match")
+    );
     let context = p.integer("context_length")?;
     let epsilon = p.number("attention.layer_norm_rms_epsilon")? as f32;
     let count = p.integer("block_count")?;
@@ -236,26 +239,25 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
     let ff_layers = file.unsigned_integers(&format!("{PREFIX}.feed_forward_length"))?;
     ensure!(
         kv_layers.len() == count && ff_layers.len() == count,
-        "per-layer topology arrays must cover every block"
+        Error::Checkpoint("per-layer topology arrays must cover every block")
     );
-    let kv = kv_layers
-        .iter()
-        .copied()
-        .find(|&kv| kv > 0)
-        .context("Nemotron requires at least one attention block")?;
-    let kv = usize::try_from(kv)?;
+    let kv = kv_layers.iter().copied().find(|&kv| kv > 0).context(
+        Error::Checkpoint,
+        "Nemotron requires at least one attention block",
+    )?;
+    let kv = usize::try_from(kv).context(Error::Checkpoint, "attention head count overflow")?;
     ensure!(
         kv_layers
             .iter()
             .all(|&layer| layer == 0 || layer as usize == kv),
-        "attention blocks must share one key/value head count"
+        Error::Checkpoint("attention blocks must share one key/value head count")
     );
     let expert_width = p.integer("expert_feed_forward_length")?;
     ensure!(
         ff_layers
             .iter()
             .all(|&layer| layer == 0 || layer as usize == expert_width),
-        "expert blocks must share one expert width"
+        Error::Checkpoint("expert blocks must share one expert width")
     );
     ensure!(
         hidden <= 16384
@@ -267,7 +269,7 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
             && count <= 128
             && epsilon.is_finite()
             && epsilon > 0.0,
-        "unsupported Nemotron geometry"
+        Error::Checkpoint("unsupported Nemotron geometry")
     );
     let g = Geometry {
         hidden,
@@ -284,15 +286,18 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
     let active = p.integer("expert_used_count")?;
     ensure!(
         experts <= 128 && active <= 8 && active <= experts,
-        "unsupported expert routing size"
+        Error::Checkpoint("unsupported expert routing size")
     );
     let shared_width = p.integer("expert_shared_feed_forward_length")?;
     ensure!(
         shared_width.is_multiple_of(64) && shared_width <= active * expert_width,
-        "unsupported shared expert width"
+        Error::Checkpoint("unsupported shared expert width")
     );
     let shared_count = p.optional("expert_shared_count", 1.0)?;
-    ensure!(shared_count == 1.0, "Nemotron requires one shared expert");
+    ensure!(
+        shared_count == 1.0,
+        Error::Checkpoint("Nemotron requires one shared expert")
+    );
     let normalize_key = format!("{PREFIX}.expert_weights_norm");
     let normalize = if file.meta.contains_key(&normalize_key) {
         file.boolean(&normalize_key)?
@@ -302,7 +307,7 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
     let scale = p.optional("expert_weights_scale", 1.0)? as f32;
     ensure!(
         scale.is_finite() && scale > 0.0,
-        "invalid expert weight scale"
+        Error::Checkpoint("invalid expert weight scale")
     );
     let groups = p.integer("ssm.group_count")?;
     let ssm_heads = p.integer("ssm.time_step_rank")?;
@@ -318,7 +323,7 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
             && inner.is_multiple_of(64)
             && inner / groups <= 512
             && (inner / ssm_heads).is_multiple_of(4),
-        "unsupported Mamba-2 geometry"
+        Error::Checkpoint("unsupported Mamba-2 geometry")
     );
     let t = Topology {
         ssm_heads,
@@ -372,7 +377,10 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
             selected::Mixer::Experts(experts) => Some(experts.shared_up.matrix.kind),
             _ => None,
         })
-        .context("Nemotron requires at least one expert block")?;
+        .context(
+            Error::Checkpoint,
+            "Nemotron requires at least one expert block",
+        )?;
     ensure!(
         selected.iter().all(|layer| match &layer.mixer {
             selected::Mixer::Experts(experts) =>
@@ -380,7 +388,7 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
                     && experts.shared_down.matrix.kind == shared_kind,
             _ => true,
         }),
-        "shared experts must share one weight encoding"
+        Error::Checkpoint("shared experts must share one weight encoding")
     );
     ensure!(
         matches!(
@@ -392,7 +400,7 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
                 | WeightFormat::F16
                 | WeightFormat::Bf16
         ),
-        "unsupported shared expert encoding {shared_kind:?}"
+        Error::Checkpoint("unsupported shared expert encoding {shared_kind:?}")
     );
     let shared_vectors = (
         i.builder

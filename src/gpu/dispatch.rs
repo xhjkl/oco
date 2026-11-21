@@ -1,5 +1,5 @@
 use super::{Buffer, BufferRef, Pipeline, profile};
-use anyhow::{Result, anyhow};
+use crate::error::{Context, Error, Result};
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSRange;
 use objc2_metal::*;
@@ -37,10 +37,9 @@ impl CommandMemory {
         weights: Option<std::sync::Arc<super::ResidentWeights>>,
     ) -> Result<Self> {
         let allocator = device.newCommandAllocator();
-        let allocator =
-            allocator.ok_or_else(|| anyhow!("Metal command allocator creation failed"))?;
+        let allocator = allocator.context(Error::Gpu, "Metal command allocator creation failed")?;
         let command = device.newCommandBuffer();
-        let command = command.ok_or_else(|| anyhow!("Metal command buffer creation failed"))?;
+        let command = command.context(Error::Gpu, "Metal command buffer creation failed")?;
         let descriptor = MTL4ArgumentTableDescriptor::new();
         descriptor.setMaxBufferBindCount(31);
         let table = device.newArgumentTableWithDescriptor_error(&descriptor)?;

@@ -1,16 +1,18 @@
 //! Teacher-forced agreement: feed a token sequence and count how often Oco's greedy prediction
 //! matches the token that actually follows. Usage: agree MODEL.gguf PROMPT_LEN ID ID ID ...
-use anyhow::{Context, Result, ensure};
+use std::error::Error;
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
-        .context("usage: agree MODEL.gguf PROMPT_LEN IDS...")?;
-    let prompt_len: usize = args.next().context("PROMPT_LEN")?.parse()?;
+        .ok_or("usage: agree MODEL.gguf PROMPT_LEN IDS...")?;
+    let prompt_len: usize = args.next().ok_or("PROMPT_LEN")?.parse()?;
     let ids: Vec<u32> = args.map(|s| s.parse()).collect::<Result<_, _>>()?;
-    ensure!(ids.len() > prompt_len + 1, "need tokens after the prompt");
+    if ids.len() <= prompt_len + 1 {
+        return Err("need tokens after the prompt".into());
+    }
     let weights = oco::load(&path)?;
     let tokenizer = weights.tokenizer();
     let mut session = weights.new_session(ids.len() + 1)?;
@@ -18,7 +20,7 @@ async fn main() -> Result<()> {
         .infer(ids[..prompt_len].to_vec())?
         .next()
         .await?
-        .context("no prediction")?;
+        .ok_or("no prediction")?;
     let (mut agree, mut total) = (0usize, 0usize);
     let mut misses = Vec::new();
     for i in prompt_len..ids.len() {
@@ -37,7 +39,7 @@ async fn main() -> Result<()> {
                 .infer(vec![ids[i]])?
                 .next()
                 .await?
-                .context("no prediction")?;
+                .ok_or("no prediction")?;
         }
     }
     println!(

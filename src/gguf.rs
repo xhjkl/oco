@@ -1,5 +1,5 @@
+use crate::error::{Context, Error, Result, bail, ensure};
 use crate::tensor::WeightFormat;
-use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
 use std::{
     collections::{HashMap, HashSet},
@@ -54,27 +54,27 @@ impl Entry {
         };
         ensure!(
             self.offset.is_multiple_of(alignment),
-            "unaligned tensor data"
+            Error::Checkpoint("unaligned tensor data")
         );
         let (block, size) = kind.block_layout();
         ensure!(
             shape[0].is_multiple_of(block),
-            "invalid tensor block alignment"
+            Error::Checkpoint("invalid tensor block alignment")
         );
         let elements = shape
             .iter()
             .try_fold(1usize, |a, &b| a.checked_mul(b))
-            .context("tensor size overflow")?;
+            .context(Error::Checkpoint, "tensor size overflow")?;
         ensure!(
             elements <= u32::MAX as usize,
-            "tensor exceeds the supported Metal index range"
+            Error::Checkpoint("tensor exceeds the supported Metal index range")
         );
         let bytes = (elements / block)
             .checked_mul(size)
-            .context("tensor size overflow")?;
+            .context(Error::Checkpoint, "tensor size overflow")?;
         ensure!(
             bytes <= self.extent,
-            "truncated or overlapping selected tensor"
+            Error::Checkpoint("truncated or overlapping selected tensor")
         );
         Ok(Tensor {
             shape,
@@ -108,21 +108,30 @@ impl Gguf {
         let map = Arc::new(map);
         let mut r = Reader::new(&map);
         let magic = r.u32()?;
-        ensure!(magic == 0x46554747, "not a GGUF file");
+        ensure!(magic == 0x46554747, Error::Checkpoint("not a GGUF file"));
         let version = r.u32()?;
-        ensure!(version == 3, "only GGUF version 3 is supported");
+        ensure!(
+            version == 3,
+            Error::Checkpoint("only GGUF version 3 is supported")
+        );
         let nt = r.usize()?;
         let nm = r.usize()?;
-        ensure!(nm <= MAX_ENTRIES, "excessive GGUF metadata count");
+        ensure!(
+            nm <= MAX_ENTRIES,
+            Error::Checkpoint("excessive GGUF metadata count")
+        );
         ensure!(
             nm <= r.remaining() / 12,
-            "truncated GGUF metadata directory"
+            Error::Checkpoint("truncated GGUF metadata directory")
         );
         let mut meta = HashMap::new();
         let mut keys = HashSet::with_capacity(nm);
         for _ in 0..nm {
             let key = r.string()?;
-            ensure!(keys.insert(key), "duplicate GGUF metadata key");
+            ensure!(
+                keys.insert(key),
+                Error::Checkpoint("duplicate GGUF metadata key")
+            );
             let kind = r.u32()?;
             let start = r.0.position() as usize;
             r.skip_value(kind, 0)?;
@@ -150,23 +159,26 @@ impl Gguf {
     pub fn directory(&self) -> Result<HashMap<&str, Entry>> {
         ensure!(
             self.tensor_count <= MAX_ENTRIES,
-            "excessive GGUF tensor count"
+            Error::Checkpoint("excessive GGUF tensor count")
         );
         let mut r = Reader::new(&self.map);
         r.0.set_position(self.tensor_offset);
         ensure!(
             self.tensor_count <= r.remaining() / 32,
-            "truncated GGUF tensor directory"
+            Error::Checkpoint("truncated GGUF tensor directory")
         );
         let mut tensors = HashMap::with_capacity(self.tensor_count);
         for _ in 0..self.tensor_count {
             let name = r.string()?;
             let dims = r.u32()?;
-            ensure!((1..=4).contains(&dims), "invalid dimensions for {name}");
+            ensure!(
+                (1..=4).contains(&dims),
+                Error::Checkpoint("invalid dimensions for {name}")
+            );
             let mut shape = [0; 4];
             for dim in &mut shape[..dims as usize] {
                 let d = r.usize()?;
-                ensure!(d > 0, "zero tensor dimension");
+                ensure!(d > 0, Error::Checkpoint("zero tensor dimension"));
                 *dim = d;
             }
             let code = r.u32()?;
@@ -181,35 +193,51 @@ impl Gguf {
                     extent: 0,
                 },
             );
-            ensure!(previous.is_none(), "duplicate tensor name");
+            ensure!(
+                previous.is_none(),
+                Error::Checkpoint("duplicate tensor name")
+            );
         }
         let alignment = self.optional_unsigned("general.alignment")?.unwrap_or(32);
-        let alignment = usize::try_from(alignment).context("GGUF alignment overflow")?;
+        let alignment =
+            usize::try_from(alignment).context(Error::Checkpoint, "GGUF alignment overflow")?;
         ensure!(
             alignment.is_power_of_two() && alignment <= 4096,
-            "invalid GGUF alignment"
+            Error::Checkpoint("invalid GGUF alignment")
         );
         let start = (r.0.position() as usize)
             .checked_next_multiple_of(alignment)
-            .context("GGUF data offset overflow")?;
+            .context(Error::Checkpoint, "GGUF data offset overflow")?;
         let mut sorted: Vec<_> = tensors.values_mut().collect();
         sorted.sort_unstable_by_key(|t| t.offset);
         for i in 0..sorted.len() {
             let offset = sorted[i].offset;
-            ensure!(offset.is_multiple_of(alignment), "unaligned tensor");
+            ensure!(
+                offset.is_multiple_of(alignment),
+                Error::Checkpoint("unaligned tensor")
+            );
             let absolute = start
                 .checked_add(offset)
-                .context("tensor offset overflow")?;
-            ensure!(absolute < self.map.len(), "tensor offset outside file");
+                .context(Error::Checkpoint, "tensor offset overflow")?;
+            ensure!(
+                absolute < self.map.len(),
+                Error::Checkpoint("tensor offset outside file")
+            );
             let end = if let Some(next) = sorted.get(i + 1) {
-                ensure!(offset < next.offset, "overlapping tensor offsets");
+                ensure!(
+                    offset < next.offset,
+                    Error::Checkpoint("overlapping tensor offsets")
+                );
                 start
                     .checked_add(next.offset)
-                    .context("tensor offset overflow")?
+                    .context(Error::Checkpoint, "tensor offset overflow")?
             } else {
                 self.map.len()
             };
-            ensure!(end <= self.map.len(), "tensor offset outside file");
+            ensure!(
+                end <= self.map.len(),
+                Error::Checkpoint("tensor offset outside file")
+            );
             sorted[i].offset = absolute;
             sorted[i].extent = end - absolute;
         }
@@ -220,8 +248,11 @@ impl Gguf {
         let field = self
             .meta
             .get(key)
-            .with_context(|| format!("missing metadata {key}"))?;
-        ensure!(field.kind != 9, "expected scalar metadata {key}");
+            .with_context(Error::Checkpoint, || format!("missing metadata {key}"))?;
+        ensure!(
+            field.kind != 9,
+            Error::Checkpoint("expected scalar metadata {key}")
+        );
         let mut r = Reader::new(&self.map[field.bytes.clone()]);
         r.value(field.kind)
     }
@@ -229,7 +260,7 @@ impl Gguf {
     pub fn text(&self, key: &str) -> Result<&str> {
         match self.value(key)? {
             Value::String(value) => Ok(value),
-            _ => bail!("expected string {key}"),
+            _ => bail!(Error::Checkpoint("expected string {key}")),
         }
     }
 
@@ -238,9 +269,12 @@ impl Gguf {
             Value::Unsigned(value) => value as f64,
             Value::Signed(value) => value as f64,
             Value::Float(value) => value,
-            _ => bail!("expected number {key}"),
+            _ => bail!(Error::Checkpoint("expected number {key}")),
         };
-        ensure!(value.is_finite(), "non-finite number {key}");
+        ensure!(
+            value.is_finite(),
+            Error::Checkpoint("non-finite number {key}")
+        );
         Ok(value)
     }
 
@@ -248,7 +282,7 @@ impl Gguf {
         match self.value(key)? {
             Value::Bool(value) => Ok(value),
             Value::Unsigned(value) if value <= 1 => Ok(value == 1),
-            _ => bail!("expected boolean {key}"),
+            _ => bail!(Error::Checkpoint("expected boolean {key}")),
         }
     }
 
@@ -259,7 +293,7 @@ impl Gguf {
         match self.value(key)? {
             Value::Unsigned(value) => Ok(Some(value)),
             Value::Signed(value) if value >= 0 => Ok(Some(value as u64)),
-            _ => bail!("expected unsigned integer {key}"),
+            _ => bail!(Error::Checkpoint("expected unsigned integer {key}")),
         }
     }
 
@@ -268,11 +302,17 @@ impl Gguf {
         let field = self
             .meta
             .get(key)
-            .with_context(|| format!("missing metadata {key}"))?;
-        ensure!(field.kind == 9, "expected array metadata {key}");
+            .with_context(Error::Checkpoint, || format!("missing metadata {key}"))?;
+        ensure!(
+            field.kind == 9,
+            Error::Checkpoint("expected array metadata {key}")
+        );
         let mut reader = Reader::new(&self.map[field.bytes.clone()]);
         let (element, count) = reader.array_header()?;
-        ensure!(element == kind, "unexpected array element type for {key}");
+        ensure!(
+            element == kind,
+            Error::Checkpoint("unexpected array element type for {key}")
+        );
         Ok((reader, count))
     }
 
@@ -286,15 +326,18 @@ impl Gguf {
         let field = self
             .meta
             .get(key)
-            .with_context(|| format!("missing metadata {key}"))?;
-        ensure!(field.kind == 9, "expected array metadata {key}");
+            .with_context(Error::Checkpoint, || format!("missing metadata {key}"))?;
+        ensure!(
+            field.kind == 9,
+            Error::Checkpoint("expected array metadata {key}")
+        );
         let mut reader = Reader::new(&self.map[field.bytes.clone()]);
         let (element, count) = reader.array_header()?;
         (0..count)
             .map(|_| match reader.value(element)? {
                 Value::Unsigned(value) => Ok(value),
                 Value::Signed(value) if value >= 0 => Ok(value as u64),
-                _ => bail!("expected unsigned integer array {key}"),
+                _ => bail!(Error::Checkpoint("expected unsigned integer array {key}")),
             })
             .collect()
     }
@@ -346,14 +389,19 @@ impl<'a> Reader<'a> {
 
     fn usize(&mut self) -> Result<usize> {
         let bytes = self.bytes()?;
-        usize::try_from(u64::from_le_bytes(bytes)).context("GGUF length overflow")
+        usize::try_from(u64::from_le_bytes(bytes))
+            .context(Error::Checkpoint, "GGUF length overflow")
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let start = self.0.position() as usize;
-        let end = start.checked_add(n).context("GGUF value size overflow")?;
+        let end = start
+            .checked_add(n)
+            .context(Error::Checkpoint, "GGUF value size overflow")?;
         let source = *self.0.get_ref();
-        let bytes = source.get(start..end).context("truncated GGUF value")?;
+        let bytes = source
+            .get(start..end)
+            .context(Error::Checkpoint, "truncated GGUF value")?;
         self.0.set_position(end as u64);
         Ok(bytes)
     }
@@ -361,7 +409,7 @@ impl<'a> Reader<'a> {
     fn string(&mut self) -> Result<&'a str> {
         let n = self.usize()?;
         let bytes = self.take(n)?;
-        Ok(std::str::from_utf8(bytes)?)
+        std::str::from_utf8(bytes).context(Error::Checkpoint, "GGUF string is not UTF-8")
     }
 
     fn array_header(&mut self) -> Result<(u32, usize)> {
@@ -374,17 +422,17 @@ impl<'a> Reader<'a> {
         };
         ensure!(
             n <= MAX_VALUES && n <= self.remaining() / minimum,
-            "excessive or truncated metadata array"
+            Error::Checkpoint("excessive or truncated metadata array")
         );
         Ok((kind, n))
     }
 
     fn skip_value(&mut self, kind: u32, depth: usize) -> Result<()> {
-        ensure!(depth < 4, "nested metadata is too deep");
+        ensure!(depth < 4, Error::Checkpoint("nested metadata is too deep"));
         self.1 = self
             .1
             .checked_sub(1)
-            .context("metadata exceeds aggregate value budget")?;
+            .context(Error::Checkpoint, "metadata exceeds aggregate value budget")?;
         match kind {
             8 => {
                 let n = self.usize()?;
@@ -403,13 +451,19 @@ impl<'a> Reader<'a> {
     }
 
     fn skip_array(&mut self, kind: u32, n: usize, depth: usize) -> Result<()> {
-        ensure!(n <= self.1, "metadata exceeds aggregate value budget");
+        ensure!(
+            n <= self.1,
+            Error::Checkpoint("metadata exceeds aggregate value budget")
+        );
         if kind != 8 && kind != 9 {
-            ensure!(depth + 1 < 4, "nested metadata is too deep");
+            ensure!(
+                depth + 1 < 4,
+                Error::Checkpoint("nested metadata is too deep")
+            );
             self.1 -= n;
             let bytes = scalar_bytes(kind)?
                 .checked_mul(n)
-                .context("GGUF array size overflow")?;
+                .context(Error::Checkpoint, "GGUF array size overflow")?;
             self.take(bytes)?;
         } else {
             for _ in 0..n {
@@ -451,7 +505,7 @@ impl<'a> Reader<'a> {
             }
             7 => {
                 let v = self.bytes::<1>()?;
-                ensure!(v[0] <= 1, "invalid GGUF boolean");
+                ensure!(v[0] <= 1, Error::Checkpoint("invalid GGUF boolean"));
                 Value::Bool(v[0] == 1)
             }
             8 => Value::String(self.string()?),
@@ -467,7 +521,7 @@ impl<'a> Reader<'a> {
                 let v = self.bytes()?;
                 Value::Float(f64::from_le_bytes(v))
             }
-            _ => bail!("unknown metadata type {kind}"),
+            _ => bail!(Error::Checkpoint("unknown metadata type {kind}")),
         })
     }
 }
@@ -478,7 +532,7 @@ fn scalar_bytes(kind: u32) -> Result<usize> {
         2 | 3 => Ok(2),
         4..=6 => Ok(4),
         10..=12 => Ok(8),
-        _ => bail!("unknown metadata type {kind}"),
+        _ => bail!(Error::Checkpoint("unknown metadata type {kind}")),
     }
 }
 
@@ -496,7 +550,7 @@ fn weight_format(code: u32) -> Result<WeightFormat> {
         14 => Q6K,
         30 => Bf16,
         39 => Mxfp4,
-        _ => bail!("unsupported GGUF tensor type {code}"),
+        _ => bail!(Error::Checkpoint("unsupported GGUF tensor type {code}")),
     })
 }
 

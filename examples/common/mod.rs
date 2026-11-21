@@ -1,21 +1,25 @@
-use anyhow::{Context, Result, ensure};
 use oco::Tokenizer;
 use std::path::PathBuf;
+
+/// An example's failure: oco's, I/O's, or a usage message.
+pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub fn arguments() -> Result<(PathBuf, String)> {
     let mut args = std::env::args_os();
     args.next();
     let path = args
         .next()
-        .context("usage: <example> MODEL.gguf [QUESTION]")?;
+        .ok_or("usage: <example> MODEL.gguf [QUESTION]")?;
     let question = args.next();
     let extra = args.next();
-    ensure!(extra.is_none(), "quote the question as one argument");
+    if extra.is_some() {
+        return Err("quote the question as one argument".into());
+    }
     let question = match &question {
         None => {
             "Explain three practical ways to inspect a large log file. Keep it under 100 words."
         }
-        Some(question) => question.to_str().context("question must be UTF-8")?,
+        Some(question) => question.to_str().ok_or("question must be UTF-8")?,
     };
     Ok((path.into(), question.to_owned()))
 }
@@ -26,7 +30,7 @@ pub fn prompt(tokenizer: &Tokenizer, question: &str) -> Result<Vec<u32>> {
     let special = |name| {
         tokenizer
             .special_token(name)
-            .with_context(|| format!("missing {name}"))
+            .ok_or_else(|| format!("missing {name}"))
     };
     let mut tokens = Vec::new();
     if let Some(start) = tokenizer.special_token("<|im_start|>") {

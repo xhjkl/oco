@@ -1,5 +1,5 @@
 use super::Session;
-use anyhow::{Result, bail, ensure};
+use crate::error::{Result, bail, ensure};
 use futures_channel::mpsc::{Receiver, channel};
 use std::{
     borrow::Cow,
@@ -41,16 +41,19 @@ impl Session {
     pub fn infer<'a>(&'a mut self, tokens: impl Into<Cow<'a, [u32]>>) -> Result<Inference<'a>> {
         let tokens = tokens.into();
         let position = self.position()?;
-        ensure!(!tokens.is_empty(), "prefill needs at least one token");
+        ensure!(
+            !tokens.is_empty(),
+            Error::Request("prefill needs at least one token")
+        );
         ensure!(
             tokens.len() <= self.capacity - position,
-            "context capacity exceeded"
+            Error::Request("context capacity exceeded")
         );
         // IDs past the vocabulary select audio feature rows already encoded into this session.
         let limit = self.vocabulary_size() + self.features;
         ensure!(
             tokens.iter().all(|&t| (t as usize) < limit),
-            "token outside vocabulary"
+            Error::Request("token outside vocabulary")
         );
         Ok(Inference {
             session: self,
@@ -69,7 +72,9 @@ impl<'a> Inference<'a> {
         // Aborting before awaiting; a dropped wait cannot resume a partially updated state.
         let phase = std::mem::replace(&mut self.phase, Phase::Aborted);
         let token = match phase {
-            Phase::Aborted => bail!("inference was aborted; create a new session"),
+            Phase::Aborted => bail!(Error::Request(
+                "inference was aborted; create a new session"
+            )),
             Phase::Complete => {
                 self.phase = Phase::Complete;
                 return Ok(None);
