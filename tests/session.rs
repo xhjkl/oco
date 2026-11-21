@@ -1,6 +1,6 @@
 //! Session reuse: greedy continuations after checkpoints, rewinds, and saved contexts against
-//! a fresh session fed the same IDs. Set QWEN_PATH, GPT_OSS_PATH, and NEMOTRON_PATH to GGUF
-//! files; tests without a path are skipped.
+//! a fresh session fed the same IDs. Set QWEN_PATH, GPT_OSS_PATH, NEMOTRON_PATH and INKLING_PATH
+//! to GGUF files; tests without a path are skipped.
 mod common;
 use common::Result;
 use common::{Family, WEATHER, family, prompt};
@@ -29,6 +29,11 @@ fn gpt_oss_reuses_sessions() -> Result<()> {
 #[ignore = "near-tied logits can diverge between full and resumed prefill"]
 fn nemotron_reuses_sessions() -> Result<()> {
     reuse("NEMOTRON_PATH")
+}
+
+#[test]
+fn inkling_reuses_sessions() -> Result<()> {
+    reuse("INKLING_PATH")
 }
 
 /// Qwen3.8-27B's full 262k context needs about 16 GiB of KV cache: within the device's working

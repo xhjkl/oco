@@ -13,4 +13,5 @@
 #include "attention_tensor.metal"
 #include "recurrent.metal"
 #include "nemotron.metal"
+#include "inkling.metal"
 #include "argmax.metal"

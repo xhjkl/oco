@@ -272,6 +272,23 @@ route_plan_n(const device uint *ids [[buffer(0)]], device uint *plan [[buffer(1)
     }
 }
 
+// Expert banks are Q4_0 (Nemotron), IQ4_NL or Q8_0 (Inkling); the tiles below decode one
+// sixteen-coefficient half of a 32-coefficient block per thread and step.
+inline uint expert_block_bytes() { return weight_type == WeightFormat::Q8_0 ? 34 : 18; }
+
+inline half4x4 expert_block(const device uchar *block, short high) {
+    if (weight_type == WeightFormat::Q8_0) {
+        float scale = fp16(block);
+        const device packed_char4 *q = reinterpret_cast<const device packed_char4 *>(block + 2 + high * 16);
+        half4x4 values;
+#pragma unroll
+        for (short j = 0; j < 4; ++j)
+            values[j] = half4(scale * float4(q[j]));
+        return values;
+    }
+    return q4_block(block, high);
+}
+
 // Gathered Q4_0 expert tiles for sparse routing: BM routes × 64 output rows per threadgroup,
 // K steps of 32. Weights decode to half and are scattered into [k-block][row-block][k][row]
 // so SIMD-group loads read contiguous, untransposed 8×8 blocks; activations stage likewise as
@@ -296,7 +313,7 @@ expert_q4_blocked(const device uchar *w [[buffer(0)]], const device bfloat *x [[
     uint quad = lane / 4, lr = (quad & 4) + (lane / 2) % 4, lc = (quad & 2) * 2 + (lane % 2) * 2;
     // Weights: two threads per row, one nibble half (sixteen k values) each.
     uint wn = tid / 2, wb = tid % 2;
-    const device uchar *row_blocks = w + (expert * p.n + min(n0 + wn, p.n - 1)) * blocks * 18;
+    const device uchar *row_blocks = w + (ulong(expert) * p.n + min(n0 + wn, p.n - 1)) * blocks * expert_block_bytes();
     // Activations: each work item stages eight k values of one route.
     constexpr uint ITEMS = BM * (BK / 8), PER_THREAD = (ITEMS + 127) / 128;
     uint source[PER_THREAD];
@@ -314,7 +331,7 @@ expert_q4_blocked(const device uchar *w [[buffer(0)]], const device bfloat *x [[
         for (uint c = 0; c < CT; ++c)
             accum[r][c] = simdgroup_float8x8(0);
     for (uint k0 = 0; k0 < p.k; k0 += BK) {
-        half4x4 decoded = q4_block(row_blocks + (k0 / 32) * 18, wb);
+        half4x4 decoded = expert_block(row_blocks + (k0 / 32) * expert_block_bytes(), wb);
         half4 staged[PER_THREAD][2];
 #pragma unroll
         for (uint i = 0; i < PER_THREAD; ++i) {
@@ -421,7 +438,7 @@ expert_q4_tensor(const device uchar *w [[buffer(0)]], const device bfloat *x [[b
     bool has_hi = nr1 > NR1H;
     uint n0 = group.x * NR0, blocks = p.k / 32;
     uint wn = tid / 2, wb = tid % 2;
-    const device uchar *row_blocks = w + (expert * p.n + min(n0 + wn, p.n - 1)) * blocks * 18;
+    const device uchar *row_blocks = w + (ulong(expert) * p.n + min(n0 + wn, p.n - 1)) * blocks * expert_block_bytes();
     uint xr = tid / 4, xk = (tid % 4) * 8;
     uint route = plan[base + 1 + tile_row + min(xr, nr1 - 1)];
     uint source = TokenInput ? route / p.routes : route;
@@ -436,7 +453,7 @@ expert_q4_tensor(const device uchar *w [[buffer(0)]], const device bfloat *x [[b
     auto c0 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB0), float>();
     auto c1 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB1), float>();
     for (uint k0 = 0; k0 < p.k; k0 += NK) {
-        half4x4 decoded = q4_block(row_blocks + (k0 / 32) * 18, wb);
+        half4x4 decoded = expert_block(row_blocks + (k0 / 32) * expert_block_bytes(), wb);
         float4 v0 = float4(xrow[k0 / 4]), v1 = float4(xrow[k0 / 4 + 1]);
         if (RELU_SQR_INPUT) {
             v0 = max(v0, 0.0f);

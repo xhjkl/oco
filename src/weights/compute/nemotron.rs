@@ -52,9 +52,10 @@ struct RoutePlanN {
 }
 
 /// Words in the indirect tile plan for `routes` gathered rows: two grids, (expert, first row)
-/// pairs for every possible tile, and per-expert route lists with their counts.
+/// pairs for every possible tile of the smallest (eight-route) size, and per-expert route lists
+/// with their counts.
 pub fn plan_words(routes: usize, experts: usize) -> usize {
-    6 + 2 * (routes.div_ceil(16) + experts) + experts * (routes + 1)
+    6 + 2 * (routes.div_ceil(8) + experts) + experts * (routes + 1)
 }
 
 #[repr(C)]

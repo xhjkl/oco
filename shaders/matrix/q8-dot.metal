@@ -44,13 +44,16 @@ matvec_q8_split(const device uchar *w [[buffer(0)]], const device bfloat *x [[bu
                 uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float partial[4][2];
     uint row = group.x * 2, route = group.y;
+    // Gathered expert rows: `ids` names each route's expert, as for matvec_q4.
+    uint expert = p.experts > 1 ? ids[route] : 0,
+         input = p.experts > 1 && !p.route_major ? route / p.routes : route;
     uint blocks = p.k / 32;
-    const device bfloat *xr = x + route * p.k;
+    const device bfloat *xr = x + input * p.k;
     uint ix = lane / 4, il = lane % 4 * 8;
     const device uchar *rows[2];
 #pragma unroll
     for (uint r = 0; r < 2; r++)
-        rows[r] = w + min(row + r, p.n - 1) * blocks * 34;
+        rows[r] = w + (ulong(expert) * p.n + min(row + r, p.n - 1)) * blocks * 34;
     float sums[2] = {0, 0};
     for (uint ib = sg * 8 + ix; ib < blocks; ib += 32) {
         const device bfloat *xb = xr + ib * 32 + il;
@@ -80,7 +83,7 @@ matvec_q8_split(const device uchar *w [[buffer(0)]], const device bfloat *x [[bu
     if (tid < 2 && row + tid < p.n) {
         float v = partial[0][tid] + partial[1][tid] + partial[2][tid] + partial[3][tid];
         if (p.has_bias)
-            v += float(bfloat(bias[row + tid]));
+            v += float(bfloat(bias[expert * p.n + row + tid]));
         store_result(y, route * p.n + row + tid, v);
     }
 }

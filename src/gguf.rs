@@ -46,6 +46,7 @@ impl Entry {
             WeightFormat::F16
             | WeightFormat::Bf16
             | WeightFormat::Q4_0
+            | WeightFormat::Iq4Nl
             | WeightFormat::Q4_1
             | WeightFormat::Q8_0
             | WeightFormat::Q4K
@@ -342,6 +343,16 @@ impl Gguf {
             .collect()
     }
 
+    pub fn booleans(&self, key: &str) -> Result<Vec<bool>> {
+        let (mut reader, count) = self.array(key, 7)?;
+        (0..count)
+            .map(|_| match reader.value(7)? {
+                Value::Bool(value) => Ok(value),
+                _ => bail!(Error::Checkpoint("expected boolean array {key}")),
+            })
+            .collect()
+    }
+
     pub fn integers(&self, key: &str) -> Result<Vec<i32>> {
         let (mut reader, count) = self.array(key, 5)?;
         (0..count)
@@ -548,6 +559,7 @@ fn weight_format(code: u32) -> Result<WeightFormat> {
         12 => Q4K,
         13 => Q5K,
         14 => Q6K,
+        20 => Iq4Nl,
         30 => Bf16,
         39 => Mxfp4,
         _ => bail!(Error::Checkpoint("unsupported GGUF tensor type {code}")),

@@ -159,8 +159,8 @@ matvec_q4(const device uchar *w [[buffer(0)]], const device bfloat *x [[buffer(1
           uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
           uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
           uint3 launch [[threads_per_threadgroup]]) {
-    const uint block_bytes = weight_type == WeightFormat::Q4_0 ? 18 : 20;
-    const uint code_offset = weight_type == WeightFormat::Q4_0 ? 2 : 4;
+    const uint block_bytes = weight_type == WeightFormat::Q4_1 ? 20 : 18;
+    const uint code_offset = weight_type == WeightFormat::Q4_1 ? 4 : 2;
     uint row = (group.x * (launch.x / 32) + sg) * 4, route = group.y;
     uint expert = p.experts > 1 ? ids[route] : 0,
          input = p.experts > 1 && !p.route_major ? route / p.routes : route;
@@ -173,6 +173,50 @@ matvec_q4(const device uchar *w [[buffer(0)]], const device bfloat *x [[buffer(1
     uint ix = lane / 2, il = lane % 2 * 8;
     const device bfloat *yb = x + input * p.k + ix * 32 + il;
     float sums[4] = {0, 0, 0, 0};
+    if (weight_type == WeightFormat::IQ4_NL) {
+        // Divergent nibble lookups read a threadgroup copy of the codebook.
+        threadgroup float levels[16];
+        if (tid < 16)
+            levels[tid] = iq4nl_levels[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ib = ix; ib < blocks; ib += 16) {
+            uint4 lo = *reinterpret_cast<const device uint4 *>(yb);
+            uint4 hi = *reinterpret_cast<const device uint4 *>(yb + 16);
+            float yl[16];
+#pragma unroll
+            for (uint j = 0; j < 4; j++) {
+                float a0 = as_type<float>(lo[j] << 16), a1 = as_type<float>(lo[j] & 0xffff0000u);
+                float b0 = as_type<float>(hi[j] << 16), b1 = as_type<float>(hi[j] & 0xffff0000u);
+                if (RELU_SQR_INPUT) {
+                    a0 = max(a0, 0.0f) * max(a0, 0.0f);
+                    a1 = max(a1, 0.0f) * max(a1, 0.0f);
+                    b0 = max(b0, 0.0f) * max(b0, 0.0f);
+                    b1 = max(b1, 0.0f) * max(b1, 0.0f);
+                }
+                yl[2 * j] = a0;
+                yl[2 * j + 1] = a1;
+                yl[2 * j + 8] = b0;
+                yl[2 * j + 9] = b1;
+            }
+#pragma unroll
+            for (uint r = 0; r < 4; r++) {
+                const device uchar *b = rows[r] + ib * block_bytes;
+                float d = fp16(b);
+                const device ushort *qs = reinterpret_cast<const device ushort *>(b + code_offset + il);
+                float acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+#pragma unroll
+                for (uint j = 0; j < 4; j++) {
+                    ushort q = qs[j];
+                    acc0 = fma(yl[2 * j], levels[q & 15], acc0);
+                    acc1 = fma(yl[2 * j + 1], levels[(q >> 8) & 15], acc1);
+                    acc2 = fma(yl[2 * j + 8], levels[(q >> 4) & 15], acc2);
+                    acc3 = fma(yl[2 * j + 9], levels[q >> 12], acc3);
+                }
+                sums[r] = fma(d, (acc0 + acc1) + (acc2 + acc3), sums[r]);
+            }
+            yb += 16 * 32;
+        }
+    } else
     for (uint ib = ix; ib < blocks; ib += 16) {
         uint4 lo = *reinterpret_cast<const device uint4 *>(yb);
         uint4 hi = *reinterpret_cast<const device uint4 *>(yb + 16);

@@ -69,6 +69,34 @@ pub struct NemotronPipelines {
     pub expert_down: [Pipeline; 2],
 }
 
+/// Inkling 2 kernels: depth mix, loop controllers, short convolutions, clipped relative-bias
+/// attention, SITU, and the sigmoid router and tile plan shared with Nemotron.
+pub struct InklingPipelines {
+    pub mix: Pipeline,
+    pub control_input: Pipeline,
+    pub control: Pipeline,
+    pub conv: Pipeline,
+    pub qkv: Pipeline,
+    pub attention: Pipeline,
+    pub situ: Pipeline,
+    pub combine: Pipeline,
+    pub router_logits: Pipeline,
+    pub route: Pipeline,
+    pub route_plan: Pipeline,
+    pub lowrank: Pipeline,
+}
+
+/// Gathered expert kernels for one bank encoding (IQ4_NL or Q8_0): single-route vector rows and
+/// eight-route SIMD-group / 32-route tensor tiles.
+pub struct InklingExpertPipelines {
+    pub vector: Pipeline,
+    pub vector_threads: usize,
+    /// Output rows one vector threadgroup produces.
+    pub vector_rows: usize,
+    pub up: [Pipeline; 2],
+    pub down: [Pipeline; 2],
+}
+
 /// Kernels shared by the audio encoders and the Whisper decoder: mean-centered normalization,
 /// GELU, positional tables, and convolution unfolding.
 pub struct AudioPipelines {
@@ -496,6 +524,52 @@ impl Builder {
             expert_down: [
                 self.get_relu_sqr("expert_q4_down_8", Q4_0)?,
                 self.get_relu_sqr("expert_q4_tensor_down", Q4_0)?,
+            ],
+        })
+    }
+
+    pub fn inkling(&mut self) -> Result<InklingPipelines> {
+        use WeightFormat::F32;
+        Ok(InklingPipelines {
+            mix: self.get("inkling_mix", F32, 0)?,
+            control_input: self.get("inkling_control_input", F32, 0)?,
+            control: self.get("inkling_control", F32, 0)?,
+            conv: self.get("inkling_conv", F32, 0)?,
+            qkv: self.get("inkling_qkv", F32, 0)?,
+            attention: self.get("inkling_attention", F32, 0)?,
+            situ: self.get("inkling_situ", F32, 0)?,
+            combine: self.get("inkling_combine", F32, 0)?,
+            router_logits: self.get("inkling_router_logits", F32, 0)?,
+            route: self.get("inkling_route", F32, 0)?,
+            route_plan: self.get("route_plan_n", F32, 0)?,
+            lowrank: self.get("inkling_lowrank", F32, 0)?,
+        })
+    }
+
+    pub fn inkling_experts(
+        &mut self,
+        format: WeightFormat,
+        width: usize,
+    ) -> Result<InklingExpertPipelines> {
+        let (vector, vector_threads, vector_rows) = match format {
+            WeightFormat::Iq4Nl => {
+                let threads = Self::vector_threads(width);
+                (self.get("matvec_q4", format, 0)?, threads, threads / 8)
+            }
+            WeightFormat::Q8_0 => (self.get("matvec_q8_split", format, 0)?, 128, 2),
+            _ => bail!(Error::Checkpoint("unsupported expert encoding {format:?}")),
+        };
+        Ok(InklingExpertPipelines {
+            vector,
+            vector_threads,
+            vector_rows,
+            up: [
+                self.get("expert_q4_up_8", format, 0)?,
+                self.get("expert_q4_tensor_up", format, 0)?,
+            ],
+            down: [
+                self.get("expert_q4_down_8", format, 0)?,
+                self.get("expert_q4_tensor_down", format, 0)?,
             ],
         })
     }

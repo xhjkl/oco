@@ -65,7 +65,7 @@ pub fn inspect(path: impl AsRef<Path>) -> Result<ModelInfo> {
     ensure!(
         matches!(
             architecture.as_str(),
-            "qwen35" | "qwen3" | "qwen3vl" | "gpt-oss" | "nemotron_h_moe"
+            "qwen35" | "qwen3" | "qwen3vl" | "gpt-oss" | "nemotron_h_moe" | "inkling2_loop"
         ),
         Error::Checkpoint("unsupported architecture {architecture}")
     );

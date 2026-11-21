@@ -1,6 +1,6 @@
 //! Conversation-level acceptance: each checkpoint answers a factual question and issues a
-//! well-formed tool call under its own protocol. Set QWEN_PATH, GPT_OSS_PATH, and
-//! NEMOTRON_PATH to GGUF files; tests without a path are skipped.
+//! well-formed tool call under its own protocol. Set QWEN_PATH, GPT_OSS_PATH, NEMOTRON_PATH and
+//! INKLING_PATH to GGUF files; tests without a path are skipped.
 mod common;
 use common::Result;
 use common::{Family, WEATHER, family, generate, prompt};
@@ -24,6 +24,11 @@ fn nemotron_answers_and_calls_tools() -> Result<()> {
     converse("NEMOTRON_PATH")
 }
 
+#[test]
+fn inkling_answers_and_calls_tools() -> Result<()> {
+    converse("INKLING_PATH")
+}
+
 fn converse(variable: &str) -> Result<()> {
     let Some(path) = std::env::var_os(variable) else {
         eprintln!("{variable} unset; skipping");
@@ -40,7 +45,9 @@ fn converse(variable: &str) -> Result<()> {
         "What is the capital of France? Reply with just the city name.",
         None,
     )?;
-    let answer = generate(&weights, &question, 160)?;
+    // Inkling thinks a little even at its lowest effort.
+    let limit = if family == Family::Inkling { 400 } else { 160 };
+    let answer = generate(&weights, &question, limit)?;
     eprintln!(
         "{variable} answer ({:?}, prefill {:.2?}, {} tokens in {:.2?}): {}",
         family,
@@ -65,16 +72,22 @@ fn converse(variable: &str) -> Result<()> {
         "What's the weather like in Paris right now?",
         Some(&WEATHER),
     )?;
-    let call = generate(&weights, &request, 200)?;
+    let call = generate(&weights, &request, limit + 40)?;
     eprintln!(
         "{variable} tool call ({} tokens in {:.2?}): {}",
         call.tokens.len(),
         call.decode,
         call.text.trim()
     );
-    // Only Nemotron reasons before its call; Harmony's commentary channel is the call itself.
+    // Nemotron and Inkling reason before their calls; Harmony's commentary channel is the call.
     let text = match family {
         Family::Nemotron => final_text(family, &call.text),
+        Family::Inkling => call
+            .text
+            .rsplit("<|content_thinking|>")
+            .next()
+            .unwrap_or(&call.text)
+            .to_owned(),
         _ => call.text.clone(),
     };
     let text = text.as_str();
@@ -100,6 +113,15 @@ fn converse(variable: &str) -> Result<()> {
                 "call must end the turn"
             );
         }
+        Family::Inkling => {
+            assert!(
+                text.contains("get_weather<|content_invoke_tool_json|>"),
+                "no JSON call of get_weather in {text:?}"
+            );
+            assert!(text.contains("\"city\""), "no city argument in {text:?}");
+            let last = call.tokens.last().copied();
+            assert_eq!(last, tokenizer.eos_token(), "call must end sampling");
+        }
         Family::GptOss => {
             assert!(
                 text.contains("commentary to=functions.get_weather"),
@@ -124,5 +146,10 @@ fn final_text(family: Family, text: &str) -> String {
         Family::GptOss => text.rsplit("<|message|>").next().unwrap_or(text).to_owned(),
         Family::Nemotron => text.rsplit("</think>").next().unwrap_or(text).to_owned(),
         Family::Qwen => text.to_owned(),
+        Family::Inkling => text
+            .rsplit("<|content_text|>")
+            .next()
+            .unwrap_or(text)
+            .to_owned(),
     }
 }

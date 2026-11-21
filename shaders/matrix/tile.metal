@@ -1,7 +1,8 @@
 // Return one packed row's byte span; GGUF validation requires block-aligned rows.
 inline uint packed_row_bytes(uint k) {
     switch (weight_type) {
-        case WeightFormat::Q4_0: return k / 32 * 18;
+        case WeightFormat::Q4_0:
+        case WeightFormat::IQ4_NL: return k / 32 * 18;
         case WeightFormat::Q4_1: return k / 32 * 20;
         case WeightFormat::Q8_0: return k / 32 * 34;
         case WeightFormat::Q4K: return k / 256 * 144;
@@ -21,6 +22,13 @@ inline void decode_weights16(const device uchar *row, uint k, thread float *out)
 #pragma unroll
         for (uint j = 0; j < 16; ++j)
             out[j] = float(scale * float(q[j]));
+    } else if (weight_type == WeightFormat::IQ4_NL) {
+        const device uchar *b = row + k / 32 * 18;
+        float scale = fp16(b);
+        uint shift = k % 32 / 16 * 4;
+#pragma unroll
+        for (uint j = 0; j < 16; ++j)
+            out[j] = scale * iq4nl_levels[(b[2 + j] >> shift) & 15];
     } else if (weight_type == WeightFormat::Q4_0 || weight_type == WeightFormat::Q4_1) {
         const device uchar *b = row + k / 32 * (weight_type == WeightFormat::Q4_0 ? 18 : 20);
         float scale = fp16(b), offset = weight_type == WeightFormat::Q4_1 ? fp16(b + 2) : 0;

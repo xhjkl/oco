@@ -8,6 +8,7 @@ macro_rules! with_architecture {
             $enum::QwenDelta $bindings => $body,
             $enum::QwenHybrid $bindings => $body,
             $enum::Nemotron $bindings => $body,
+            $enum::Inkling $bindings => $body,
         }
     };
 }
@@ -18,6 +19,7 @@ pub(crate) mod compute;
 mod dispatch_tests;
 pub(crate) mod generation;
 mod gpt_oss;
+mod inkling;
 mod load;
 mod nemotron;
 pub(crate) mod operands;
@@ -51,6 +53,7 @@ enum Architecture {
     QwenDelta(Arc<qwen::delta::QwenDelta>),
     QwenHybrid(Arc<qwen::hybrid::QwenHybrid>),
     Nemotron(Arc<nemotron::Nemotron>),
+    Inkling(Arc<inkling::Inkling>),
 }
 
 impl Architecture {
@@ -71,6 +74,7 @@ impl Architecture {
             Self::QwenDelta(_) => 0,
             Self::QwenHybrid(q) => kv_position_bytes(q.attention_layers, &q.attention),
             Self::Nemotron(n) => kv_position_bytes(n.attention_layers, &n.attention),
+            Self::Inkling(n) => n.visits() * 2 * n.plan.key_width() * 2,
         }
     }
 }

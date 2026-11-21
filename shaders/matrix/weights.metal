@@ -14,6 +14,7 @@ enum WeightFormat : uint {
     Q4K = 12,
     Q5K = 13,
     Q6K = 14,
+    IQ4_NL = 20,
     Bf16 = 30,
     Mxfp4 = 39,
 };
@@ -31,6 +32,10 @@ __attribute__((always_inline)) inline void store_result(device bfloat *y, uint i
     else
         y[i] = bfloat(v);
 }
+
+// IQ4_NL codebook: Q4_0's block layout with non-uniform levels in place of q - 8.
+constant float iq4nl_levels[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                   1,    13,   25,  38,  53,  69,  89,  113};
 
 __attribute__((always_inline)) inline float fp16(const device uchar *p) {
     return float(*reinterpret_cast<const device half *>(p));
@@ -52,6 +57,11 @@ __attribute__((always_inline)) inline float weight(const device uchar *w, uint i
         return float(reinterpret_cast<const device half *>(w)[i]);
     if (type == WeightFormat::Bf16)
         return float(reinterpret_cast<const device bfloat *>(w)[i]);
+    if (type == WeightFormat::IQ4_NL) {
+        const device uchar *b = w + (i / 32) * 18;
+        uint j = i % 32;
+        return fp16(b) * iq4nl_levels[(b[2 + j % 16] >> (j / 16 * 4)) & 15];
+    }
     if (type == WeightFormat::Q4_0 || type == WeightFormat::Q4_1) {
         const device uchar *b = w + (i / 32) * (type == WeightFormat::Q4_0 ? 18 : 20);
         uint j = i % 32;

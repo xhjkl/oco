@@ -13,13 +13,14 @@ matmul_tensor(const device uchar *w [[buffer(0)]], device bfloat *x [[buffer(1)]
               constant Matrix &p [[buffer(5)]], uint3 group [[threadgroup_position_in_grid]],
               uint3 grid [[threadgroups_per_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int NR = 64, NK = 64;
-    const bool Q4 = weight_type == WeightFormat::Q4_0 || weight_type == WeightFormat::Q4_1;
+    const bool Q4 = weight_type == WeightFormat::Q4_0 || weight_type == WeightFormat::Q4_1 ||
+                    weight_type == WeightFormat::IQ4_NL;
     threadgroup S staged[NR * NK];
     const uint n0 = group.y * NR, m0 = group.x * NT;
     // Tail columns repeat the last valid one and are never stored.
     const ushort wn = tid / 2, offset = tid % 2 * 32;
     const device uchar *column = w + ulong(min(n0 + wn, p.n - 1)) * packed_row_bytes(p.k);
-    const uint block_bytes = weight_type == WeightFormat::Q4_0 ? 18 : 20;
+    const uint block_bytes = weight_type == WeightFormat::Q4_1 ? 20 : 18;
     threadgroup vec<S, 4> *slot = reinterpret_cast<threadgroup vec<S, 4> *>(staged + wn * NK + offset);
     device bfloat *rows = x + ulong(m0) * p.k;
     const int live = int(min(uint(NT), p.m - m0));

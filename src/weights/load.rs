@@ -8,7 +8,7 @@
 pub mod selected;
 
 use super::{
-    Weights, gpt_oss, nemotron,
+    Weights, gpt_oss, inkling, nemotron,
     operands::*,
     pipelines::{Builder, ElementwisePipelines},
     qwen,
@@ -223,7 +223,7 @@ pub struct Import {
 }
 
 impl Import {
-    fn tensor(&mut self, t: gguf::Tensor<'_>) -> Result<Tensor> {
+    pub(crate) fn tensor(&mut self, t: gguf::Tensor<'_>) -> Result<Tensor> {
         let kind = t.kind;
         let shape = t.shape;
         let storage = self.binding(t)?;
@@ -317,6 +317,7 @@ fn architecture(file: &Gguf, audio: Option<&Gguf>) -> Result<super::Architecture
             gpt_oss::load(file, &p, g)?
         }
         "nemotron_h_moe" => nemotron::load(file, &p)?,
+        "inkling2_loop" => inkling::load(file, &p)?,
         _ => bail!(Error::Checkpoint("unsupported architecture {prefix}")),
     })
 }
@@ -502,4 +503,33 @@ pub(crate) const METADATA: &[&str] = &[
     "nemotron_h_moe.ssm.group_count",
     "nemotron_h_moe.ssm.inner_size",
     "nemotron_h_moe.ssm.time_step_rank",
+    "inkling2_loop.embedding_length",
+    "inkling2_loop.block_count",
+    "inkling2_loop.context_length",
+    "inkling2_loop.attention.head_count",
+    "inkling2_loop.attention.head_count_kv",
+    "inkling2_loop.attention.key_length",
+    "inkling2_loop.attention.layer_norm_rms_epsilon",
+    "inkling2_loop.expert_count",
+    "inkling2_loop.expert_used_count",
+    "inkling2_loop.expert_feed_forward_length",
+    "inkling2_loop.vocab_size_unpadded",
+    "inkling2_loop.attention.sliding_window",
+    "inkling2_loop.attention.sliding_window_pattern",
+    "inkling2_loop.shortconv.l_cache",
+    "inkling2_loop.attn_res.block_size",
+    "inkling2_loop.attention.relative_length",
+    "inkling2_loop.attention.relative_extent",
+    "inkling2_loop.attention.qk_clip",
+    "inkling2_loop.attention.relative_clip",
+    "inkling2_loop.attention.log_scale_floor",
+    "inkling2_loop.attention.log_scale_alpha",
+    "inkling2_loop.expert_weights_scale",
+    "inkling2_loop.activation.situ_beta",
+    "inkling2_loop.activation.situ_linear_beta",
+    "inkling2_loop.loop.start",
+    "inkling2_loop.loop.end",
+    "inkling2_loop.loop.count",
+    "inkling2_loop.loop.gate_rank",
+    "inkling2_loop.loop.varying",
 ];

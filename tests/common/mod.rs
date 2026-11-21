@@ -29,10 +29,14 @@ pub enum Family {
     Nemotron,
     /// Harmony channels.
     GptOss,
+    /// Inkling 2's role and content markers, with a stated thinking effort.
+    Inkling,
 }
 
 pub fn family(tokenizer: &Tokenizer) -> Family {
-    if tokenizer.special_token("<|im_start|>").is_some() {
+    if tokenizer.special_token("<|message_user|>").is_some() {
+        Family::Inkling
+    } else if tokenizer.special_token("<|im_start|>").is_some() {
         // Both families mark thinking with dedicated tokens; Nemotron inherits Tekken's
         // instruction markers while Qwen carries vision markers.
         if tokenizer.special_token("[INST]").is_some() {
@@ -132,6 +136,38 @@ pub fn prompt(
             tokens.push(end);
             tokens.push(start);
             tokens.extend(tokenizer.encode("assistant")?);
+        }
+        Family::Inkling => {
+            // As the checkpoint's chat template renders it: tool declarations, the system
+            // message, the thinking effort before the first non-system message, then the user;
+            // the model opens its own turn.
+            let system_role = special("<|message_system|>")?;
+            let text = special("<|content_text|>")?;
+            let end = special("<|end_message|>")?;
+            if let Some(tool) = tool {
+                tokens.push(system_role);
+                tokens.extend(tokenizer.encode("tool_declare")?);
+                tokens.push(special("<|content_xml|>")?);
+                tokens.extend(tokenizer.encode(&format!(
+                    "[{{\"description\":\"{}\",\"name\":\"{}\",\"parameters\":{{\"properties\":{{\"{}\":{{\"description\":\"{}\",\"type\":\"string\"}}}},\"required\":[\"{}\"],\"type\":\"object\"}},\"type\":\"function\"}}]",
+                    tool.description, tool.name, tool.parameter, tool.parameter_description, tool.parameter
+                ))?);
+                tokens.push(end);
+            }
+            if !system.is_empty() {
+                tokens.push(system_role);
+                tokens.push(text);
+                tokens.extend(tokenizer.encode(system)?);
+                tokens.push(end);
+            }
+            tokens.push(system_role);
+            tokens.push(text);
+            tokens.extend(tokenizer.encode("Thinking effort level: 0.1")?);
+            tokens.push(end);
+            tokens.push(special("<|message_user|>")?);
+            tokens.push(text);
+            tokens.extend(tokenizer.encode(user)?);
+            tokens.push(end);
         }
     }
     Ok(tokens)

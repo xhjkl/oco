@@ -6,6 +6,7 @@
 mod attention;
 mod audio;
 mod feed_forward;
+mod inkling;
 mod matrix;
 mod nemotron;
 mod recurrent;
@@ -25,6 +26,7 @@ pub use audio::{
 };
 use bytemuck::{Pod, Zeroable, bytes_of};
 pub use feed_forward::ExpertPlan;
+pub use inkling::{ControlChain, ConvCall, InklingPlan, QkvConv};
 pub use nemotron::{MambaPlan, ReluExpertPlan, plan_words};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTL4CommandQueue, MTLDevice};

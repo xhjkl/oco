@@ -65,6 +65,10 @@ enum Execution {
         weights: Arc<nemotron::Nemotron>,
         memory: nemotron::Memory,
     },
+    Inkling {
+        weights: Arc<inkling::Inkling>,
+        memory: inkling::Memory,
+    },
 }
 
 impl Session {
@@ -106,6 +110,13 @@ impl Session {
             Architecture::Nemotron(weights) => {
                 let memory = nemotron::Memory::new(weights, capacity, prefill_rows)?;
                 Execution::Nemotron {
+                    weights: weights.clone(),
+                    memory,
+                }
+            }
+            Architecture::Inkling(weights) => {
+                let memory = inkling::Memory::new(weights, capacity, prefill_rows)?;
+                Execution::Inkling {
                     weights: weights.clone(),
                     memory,
                 }
@@ -355,6 +366,7 @@ impl Session {
             Execution::QwenAttention { memory, .. } => &memory.states,
             Execution::QwenHybrid { memory, .. } => &memory.kv_states,
             Execution::Nemotron { memory, .. } => &memory.kv_states,
+            Execution::Inkling { memory, .. } => &memory.kv_states,
         }
     }
 
@@ -380,6 +392,7 @@ impl Session {
             Execution::QwenDelta { memory, .. } => &memory.states,
             Execution::QwenHybrid { memory, .. } => &memory.recurrent,
             Execution::Nemotron { memory, .. } => &memory.recurrent,
+            Execution::Inkling { memory, .. } => &memory.recurrent,
         }
     }
 

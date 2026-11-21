@@ -15,6 +15,7 @@ pub enum WeightFormat {
     Q4K = 12,
     Q5K = 13,
     Q6K = 14,
+    Iq4Nl = 20,
     Bf16 = 30,
     Mxfp4 = 39,
 }
@@ -25,7 +26,7 @@ impl WeightFormat {
         match self {
             Self::F32 => (1, 4),
             Self::F16 | Self::Bf16 => (1, 2),
-            Self::Q4_0 => (32, 18),
+            Self::Q4_0 | Self::Iq4Nl => (32, 18),
             Self::Q4_1 => (32, 20),
             Self::Q8_0 => (32, 34),
             Self::Q4K => (256, 144),

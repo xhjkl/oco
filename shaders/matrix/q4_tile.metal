@@ -13,7 +13,7 @@ __attribute__((always_inline)) inline Q4Raw q4_fetch(const device uchar *block, 
     Q4Raw raw;
     raw.scale = words[0];
     raw.offset = weight_type == WeightFormat::Q4_1 ? words[1] : 0;
-    const device ushort *qs = words + (weight_type == WeightFormat::Q4_0 ? 1 : 2);
+    const device ushort *qs = words + (weight_type == WeightFormat::Q4_1 ? 2 : 1);
 #pragma unroll
     for (short i = 0; i < 8; ++i)
         raw.qs[i] = qs[i];
@@ -26,6 +26,15 @@ __attribute__((always_inline)) inline half4x4 q4_decode(Q4Raw raw, short high) {
     float offset = weight_type == WeightFormat::Q4_0 ? -8.0f * scale : float(as_type<half>(raw.offset));
     ushort mask0 = high ? 0x00f0 : 0x000f, mask1 = mask0 << 8;
     half4x4 values;
+    if (weight_type == WeightFormat::IQ4_NL) {
+        ushort shift = high ? 4 : 0;
+#pragma unroll
+        for (short i = 0; i < 8; ++i) {
+            values[i / 2][2 * (i % 2)] = half(scale * iq4nl_levels[(raw.qs[i] >> shift) & 15]);
+            values[i / 2][2 * (i % 2) + 1] = half(scale * iq4nl_levels[(raw.qs[i] >> (shift + 8)) & 15]);
+        }
+        return values;
+    }
 #pragma unroll
     for (short i = 0; i < 8; ++i) {
         values[i / 2][2 * (i % 2)] = half(d1 * (raw.qs[i] & mask0) + offset);
@@ -63,7 +72,7 @@ inline void matmul_tile_wide(const device uchar *w, const device bfloat *x, devi
     // Clamping tail rows to valid storage; their outputs are discarded.
     ushort wn = tid / 2, wk = (tid % 2) * 16;
     ushort xm = tid / 2, xk = (tid % 2) * 16;
-    uint block_bytes = weight_type == WeightFormat::Q4_0 ? 18 : 20;
+    uint block_bytes = weight_type == WeightFormat::Q4_1 ? 20 : 18;
     const device uchar *weights = w + min(n0 + wn, p.n - 1) * packed_row_bytes(p.k);
     const device uchar *block = weights;
     const device bfloat *row = x + min(m0 + xm, p.m - 1) * p.k + xk;
@@ -159,7 +168,7 @@ inline void matmul_tile_rows(const device uchar *w, const device bfloat *x, devi
     uint n0 = group.y * 64, m0 = group.x * BM;
     uint span = p.k / grid.z, begin = group.z * span;
     ushort wn = tid / 2, wk = (tid % 2) * 16;
-    uint block_bytes = weight_type == WeightFormat::Q4_0 ? 18 : 20;
+    uint block_bytes = weight_type == WeightFormat::Q4_1 ? 20 : 18;
     const device uchar *weights = w + min(n0 + wn, p.n - 1) * packed_row_bytes(p.k);
     const device uchar *block = weights + begin / 32 * block_bytes;
     // Each of the first 4·BM threads stages eight activations of one token row.
