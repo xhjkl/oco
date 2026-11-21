@@ -81,6 +81,15 @@ impl DenseMatrix {
                 let tile = &narrow[0];
                 (&tile.pipeline, [1, tile.column_groups, 1], 128)
             }
+            DensePlan::Tensor {
+                vector: v,
+                vector_rows,
+                ..
+            } if rows <= *vector_rows => (&v.pipeline, [v.column_groups, 1, 1], v.threads),
+            DensePlan::Tensor { tiles, .. } => {
+                let tile = &tiles[0];
+                (&tile.pipeline, [1, tile.column_groups, 1], 128)
+            }
         };
         let p = Matrix {
             k: self.input as u32,
@@ -182,6 +191,20 @@ impl DenseMatrix {
                 }
                 (narrow, wide, sum)
             }
+            DensePlan::Tensor {
+                vector,
+                vector_rows,
+                tiles,
+                sum,
+            } => {
+                if m <= *vector_rows {
+                    let groups = [vector.column_groups, m, 1];
+                    first(e, &vector.pipeline, &buffers, bytes_of(&p), groups, vector.threads);
+                    return;
+                }
+                self.apply_tensor(e, (tiles, sum.as_ref()), x, y, m, &p, (bias, scales), scratch, first);
+                return;
+            }
         };
         // Complete wide tiles share decoded weights across 64 rows. One independent tail
         // dispatch covers the remainder, using two guarded 32-row groups when needed.
@@ -252,6 +275,91 @@ impl DenseMatrix {
                 first(e, &tile.pipeline, &buffers, bytes_of(&p), groups, 128);
             }
         }
+    }
+
+    /// Whole 128-row tiles, then one independent tail dispatch with the smallest tile covering
+    /// the remainder; batches of at most 64 rows take a single 32- or 64-row launch. Products
+    /// with too few tiles to fill the GPU split K instead and finish their partial sums.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_tensor(
+        &self,
+        e: &Commands,
+        (tiles, sum): (&[Tile; 3], Option<&crate::gpu::Pipeline>),
+        x: (&BufferRef, usize),
+        y: &BufferView,
+        m: usize,
+        p: &Matrix,
+        (bias, scales): ((&BufferRef, usize), (&BufferRef, usize)),
+        scratch: &CommonScratch,
+        first: fn(&Commands, &crate::gpu::Pipeline, &[(&BufferRef, usize)], &[u8], [usize; 3], usize),
+    ) {
+        let smallest = |rows: usize| &tiles[match rows {
+            0..=32 => 0,
+            33..=64 => 1,
+            _ => 2,
+        }];
+        let single = smallest(m);
+        let launched = m.div_ceil(single.rows) * single.column_groups;
+        let splits = sum.map_or(1, |_| self.tensor_splits(launched, m, scratch));
+        if let Some(sum) = sum.filter(|_| splits > 1) {
+            // Ordering both passes: the partials are shared by every product of the batch.
+            let buffers = [self.values.binding(), x, scratch.partials.binding(), bias, scales];
+            let groups = [m.div_ceil(single.rows), single.column_groups, splits];
+            dispatch(e, &single.pipeline, &buffers, bytes_of(p), groups, 128);
+            let finish = SplitSum {
+                m: m as u32,
+                n: self.output as u32,
+                splits: splits as u32,
+                has_bias: p.has_bias,
+                scaled: 0,
+            };
+            let buffers = [scratch.partials.binding(), y.binding(), bias, scales];
+            let groups = [(m * self.output).div_ceil(256), 1, 1];
+            dispatch(e, sum, &buffers, bytes_of(&finish), groups, 256);
+            return;
+        }
+        let full = if m > 64 { m / 128 * 128 } else { 0 };
+        let (x_buffer, x_offset) = x;
+        let (y_buffer, y_offset) = y.binding();
+        if full > 0 {
+            let tile = &tiles[2];
+            let p = Matrix { m: full as u32, ..*p };
+            let buffers = [self.values.binding(), x, y.binding(), bias, scales];
+            let groups = [full / 128, tile.column_groups, 1];
+            first(e, &tile.pipeline, &buffers, bytes_of(&p), groups, 128);
+        }
+        let tail = m - full;
+        if tail > 0 {
+            let tile = smallest(tail);
+            let p = Matrix { m: tail as u32, ..*p };
+            let buffers = [
+                self.values.binding(),
+                (x_buffer, x_offset + full * self.input * 2),
+                (y_buffer, y_offset + full * self.output * 2),
+                bias,
+                scales,
+            ];
+            let groups = [tail.div_ceil(tile.rows), tile.column_groups, 1];
+            let launch = if full > 0 { dispatch_concurrent } else { first };
+            launch(e, &tile.pipeline, &buffers, bytes_of(&p), groups, 128);
+        }
+    }
+
+    /// Split K for tensor tiles while fewer than 128 threadgroups would launch: power-of-two
+    /// ways up to sixteen, whole 64-column steps per split, partial sums within their scratch.
+    fn tensor_splits(&self, launched: usize, rows: usize, scratch: &CommonScratch) -> usize {
+        let steps = self.input / 64;
+        let mut splits = 1;
+        while launched * splits < 128 && splits < 16 {
+            let next = splits * 2;
+            if !steps.is_multiple_of(next)
+                || next * rows * self.output * 4 > scratch.partials.length()
+            {
+                break;
+            }
+            splits = next;
+        }
+        splits
     }
 
     /// Split K across threadgroups when a short batch launches too few narrow tiles to keep

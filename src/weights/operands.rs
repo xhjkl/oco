@@ -62,6 +62,17 @@ pub enum DensePlan {
         /// the sums are reordered.
         sum: Option<Pipeline>,
     },
+    /// Apple10 GPUs: tensor-operation tiles of 32, 64 and 128 token rows. BF16 activations
+    /// feed them directly, so no row gains are prepared.
+    Tensor {
+        vector: Vector,
+        vector_rows: usize,
+        tiles: [Tile; 3],
+        /// Finishes products whose K range was split across threadgroups. Absent for Q8_0, as
+        /// for the SIMD-group tiles: GPT-OSS's references lose near-tied tokens when its
+        /// sums are reordered.
+        sum: Option<Pipeline>,
+    },
 }
 
 /// One transformation across the expert bank, with MXFP4 weights and required F32 biases.

@@ -1,4 +1,5 @@
 mod attention;
+mod attention_tensor;
 mod audio;
 mod dense_bench;
 mod matrix_precision;

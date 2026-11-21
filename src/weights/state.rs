@@ -43,7 +43,8 @@ pub struct CommonScratch<S = BufferView> {
     pub logits: S,
     /// Greedy next-token ID, reused directly as decode input without a CPU-to-GPU copy.
     pub next: S,
-    /// FP32 sums of K-split short-batch products, one layer per split.
+    /// FP32 sums of K-split products, one layer per split; during single-token decode, the
+    /// chunk states of split-key attention.
     pub partials: S,
 }
 

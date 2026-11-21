@@ -12,14 +12,20 @@ kernel void route_plan_tiled(const device uint *ids [[buffer(0)]], device uint *
             plan[base + 1 + count++] = i;
     plan[base] = count;
     threadgroup_barrier(mem_flags::mem_device);
+    // After the lists: each expert's first row in expert-sorted order, then each route's row.
+    uint sorted = grouped + 32 * (routes + 1);
     if (expert == 0) {
-        uint tiles = 0;
-        for (uint e = 0; e < 32; e++)
-            for (uint begin = 0; begin < plan[grouped + e * (routes + 1)]; begin += TileRows) {
+        uint tiles = 0, offset = 0;
+        for (uint e = 0; e < 32; e++) {
+            uint routed = plan[grouped + e * (routes + 1)];
+            plan[sorted + e] = offset;
+            offset += routed;
+            for (uint begin = 0; begin < routed; begin += TileRows) {
                 plan[6 + tiles * 2] = e;
                 plan[6 + tiles * 2 + 1] = begin;
                 tiles++;
             }
+        }
         plan[0] = p.up_tiles;
         plan[1] = tiles;
         plan[2] = 1;
@@ -27,9 +33,37 @@ kernel void route_plan_tiled(const device uint *ids [[buffer(0)]], device uint *
         plan[4] = tiles;
         plan[5] = 1;
     }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint i = 0, offset = plan[sorted + expert]; i < count; i++)
+        plan[sorted + 32 + plan[base + 1 + i]] = offset + i;
 }
 
-template [[host_name("route_plan")]] kernel void route_plan_tiled<32>(
+// Clipped SwiGLU over the route-ordered expert projections, written as half to each route's
+// expert-sorted row, where the down tiles read their activations as contiguous rows.
+// Rejecting invalid operands before min/clamp keeps NaN from becoming a finite clipping bound.
+kernel void moe_activate(const device float *g [[buffer(0)]], const device float *u [[buffer(1)]],
+                         const device uint *plan [[buffer(2)]], device half *sorted [[buffer(3)]],
+                         constant Matrix &p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.m * p.k)
+        return;
+    uint route = i / p.k, c = i % p.k;
+    uint grouped = 6 + 2 * ((p.m + 15) / 16 + 32);
+    device half *out = sorted + ulong(plan[grouped + 32 * (p.m + 1) + 32 + route]) * p.k + c;
+    float a = g[i], b = u[i];
+    if ((as_type<uint>(a) & 0x7f800000u) == 0x7f800000u ||
+        (as_type<uint>(b) & 0x7f800000u) == 0x7f800000u) {
+        *out = half(as_type<float>(0x7fc00000u));
+        return;
+    }
+    a = min(a, 7.0f);
+    b = clamp(b, -6.0f, 8.0f);
+    float e = fast::exp(-abs(a) * 1.702f);
+    // Dividing the negative tail directly; subtracting sigmoid(abs(a)) from one loses it.
+    float sigmoid = (a < 0 ? e : 1.0f) / (1.0f + e);
+    *out = half(sigmoid * a * b);
+}
+
+template [[host_name("route_plan_64")]] kernel void route_plan_tiled<64>(
     const device uint *, device uint *, constant RoutePlan &, uint);
 
 // Keep top-four indices valid even when invalid arithmetic reaches the router.

@@ -183,18 +183,17 @@ matvec_mxfp4(const device uchar *w [[buffer(0)]], const device float *x [[buffer
 
 constant float e2m1[16] = {0, .5, 1, 1.5, 2, 3, 4, 6, -0, -.5, -1, -1.5, -2, -3, -4, -6};
 
-// Routed expert tiles on Metal 4 tensor operations: 32 routes × 64 output rows per threadgroup
-// with K steps of 32. MXFP4 blocks decode to half through the signed E2M1 table and stage as
-// [row][k]; gathered activations stage as half [route][k]. Two 16×64 cooperative products
-// accumulate in FP32 and share one 8 KiB block with the output staging; the upper half is
-// skipped when the expert owns at most sixteen routes in the tile. Up tiles write FP32 up and
-// gate projections with their biases; down tiles contract activated FP32 inputs to BF16.
-template <bool Up>
-inline void expert_mxfp4_tensor(const device uchar *w, const device uchar *x, device uchar *y,
+// Routed up and gate tiles on Metal 4 tensor operations: 64 routes × 64 output rows per
+// threadgroup with K steps of 32. MXFP4 blocks decode to half through the signed E2M1 table and
+// stage as [row][k]; gathered token activations stage as half [route][k]. Two 32×64 cooperative
+// products accumulate in FP32 and share one 16 KiB block with the output staging; the upper half
+// is skipped when the expert owns at most 32 routes in the tile. Results are FP32 projections
+// with their biases in route order.
+inline void expert_mxfp4_up(const device uchar *w, const device uchar *x, device uchar *y,
                                 const device float *bias, const device uint *plan, Matrix p,
                                 threadgroup float *shared, uint3 group, uint tid, uint lane,
                                 uint sg, uint n0) {
-    constexpr int NR0 = 64, NR1 = 32, NK = 32, NR1H = NR1 / 2;
+    constexpr int NR0 = 64, NR1 = 64, NK = 32, NR1H = NR1 / 2;
     threadgroup half *sa = reinterpret_cast<threadgroup half *>(shared);
     threadgroup half *sb = sa + NR0 * NK;
     uint expert = plan[6 + group.y * 2], tile_row = plan[6 + group.y * 2 + 1];
@@ -206,9 +205,9 @@ inline void expert_mxfp4_tensor(const device uchar *w, const device uchar *x, de
     uint blocks = p.k / 32;
     uint wn = tid / 2, wb = tid % 2;
     const device uchar *row_blocks = w + (expert * p.n + min(n0 + wn, p.n - 1)) * blocks * 17;
-    uint xr = tid / 4, xk = (tid % 4) * 8;
+    uint xr = tid / 2, xk = (tid % 2) * 16;
     uint route = plan[base + 1 + tile_row + min(xr, nr1 - 1)];
-    uint source = Up ? route / p.routes : route;
+    uint source = route / p.routes;
     auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK, NR0));
     auto tB0 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NK, NR1H));
     auto tB1 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sb + NR1H * NK, dextents<int32_t, 2>(NK, NR1H));
@@ -226,26 +225,21 @@ inline void expert_mxfp4_tensor(const device uchar *w, const device uchar *x, de
 #pragma unroll
         for (uint j = 0; j < 16; ++j)
             decoded[j] = half(e2m1[(block[1 + j] >> shift) & 15] * scale);
-        half4 staged[2];
-        if (Up) {
-            const device bfloat4 *values = reinterpret_cast<const device bfloat4 *>(
-                reinterpret_cast<const device bfloat *>(x) + source * p.k + k0 + xk);
-            staged[0] = half4(float4(values[0]));
-            staged[1] = half4(float4(values[1]));
-        } else {
-            const device float4 *values = reinterpret_cast<const device float4 *>(
-                reinterpret_cast<const device float *>(x) + source * p.k + k0 + xk);
-            staged[0] = half4(values[0]);
-            staged[1] = half4(values[1]);
-        }
+        half4 staged[4];
+        const device bfloat4 *values = reinterpret_cast<const device bfloat4 *>(
+            reinterpret_cast<const device bfloat *>(x) + source * p.k + k0 + xk);
+#pragma unroll
+        for (uint j = 0; j < 4; ++j)
+            staged[j] = half4(float4(values[j]));
         threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup half4 *wd = reinterpret_cast<threadgroup half4 *>(sa + wn * NK + wb * 16);
 #pragma unroll
         for (uint j = 0; j < 4; ++j)
             wd[j] = half4(decoded[4 * j], decoded[4 * j + 1], decoded[4 * j + 2], decoded[4 * j + 3]);
         threadgroup half4 *xd = reinterpret_cast<threadgroup half4 *>(sb + xr * NK + xk);
-        xd[0] = staged[0];
-        xd[1] = staged[1];
+#pragma unroll
+        for (uint j = 0; j < 4; ++j)
+            xd[j] = staged[j];
         threadgroup_barrier(mem_flags::mem_threadgroup);
         auto a = tA.slice(0, 0);
         auto b0 = tB0.slice(0, 0);
@@ -269,14 +263,84 @@ inline void expert_mxfp4_tensor(const device uchar *w, const device uchar *x, de
             uint col = n0 + i;
             if (col >= p.n)
                 continue;
-            float value = shared[j * NR0 + i];
-            if (Up) {
-                value += float(bfloat(bias[expert * p.n + col] + (p.has_bias == 2 ? 1.0f : 0.0f)));
-                reinterpret_cast<device float *>(y)[out * p.n + col] = value;
-            } else {
-                value += p.has_bias ? float(bfloat(bias[expert * p.n + col])) : 0.0f;
-                reinterpret_cast<device bfloat *>(y)[out * p.n + col] = bfloat(value);
-            }
+            float value = shared[j * NR0 + i] +
+                          float(bfloat(bias[expert * p.n + col] + (p.has_bias == 2 ? 1.0f : 0.0f)));
+            reinterpret_cast<device float *>(y)[out * p.n + col] = value;
+        }
+    }
+}
+
+// Routed down tiles on Metal 4 tensor operations: 64 routes × 64 output rows per threadgroup with
+// K steps of 32. MXFP4 blocks decode to half through the signed E2M1 table and stage as [row][k];
+// the routes' activations sit in contiguous expert-sorted half rows and feed the operation
+// straight from device memory. Results stage through the same 16 KiB threadgroup block and
+// scatter as BF16 to their routes' rows.
+inline void expert_mxfp4_down(const device uchar *w, device uchar *x, device uchar *y,
+                                const device float *bias, const device uint *plan, Matrix p,
+                                threadgroup half *sa, uint3 group, uint tid, uint n0) {
+    constexpr int NR0 = 64, NR1 = 64, NK = 32;
+    uint expert = plan[6 + group.y * 2], tile_row = plan[6 + group.y * 2 + 1];
+    uint grouped = 6 + 2 * ((p.m + 15) / 16 + 32);
+    uint base = grouped + expert * (p.m + 1), count = plan[base];
+    if (tile_row >= count)
+        return;
+    uint first = plan[grouped + 32 * (p.m + 1) + expert] + tile_row;
+    int live = int(min(uint(NR1), count - tile_row));
+    uint blocks = p.k / 32;
+    uint wn = tid / 2, wb = tid % 2;
+    const device uchar *row_blocks = w + (ulong(expert) * p.n + min(n0 + wn, p.n - 1)) * blocks * 17;
+    auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK, NR0));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(NR1 / 2, NR0, NK, false, true, false,
+                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+    // Two 32-route products; the upper one is skipped when the expert owns at most 32 routes
+    // in the tile.
+    const bool has_hi = live > NR1 / 2;
+    const int live_lo = min(live, NR1 / 2), live_hi = max(live - NR1 / 2, 0);
+    device half *rows = reinterpret_cast<device half *>(x) + ulong(first) * p.k;
+    auto probe = tensor(rows, dextents<int32_t, 2>(NK, live_lo), array<int, 2>({1, int(p.k)}));
+    auto c0 = mm.template get_destination_cooperative_tensor<decltype(probe), decltype(tA), float>();
+    auto c1 = mm.template get_destination_cooperative_tensor<decltype(probe), decltype(tA), float>();
+    for (uint k0 = 0; k0 < p.k; k0 += NK) {
+        const device uchar *block = row_blocks + (k0 / 32) * 17;
+        float scale = expert_mxfp4_scale(block[0]);
+        half decoded[16];
+        uint shift = wb * 4;
+#pragma unroll
+        for (uint j = 0; j < 16; ++j)
+            decoded[j] = half(e2m1[(block[1 + j] >> shift) & 15] * scale);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup half4 *wd = reinterpret_cast<threadgroup half4 *>(sa + wn * NK + wb * 16);
+#pragma unroll
+        for (uint j = 0; j < 4; ++j)
+            wd[j] = half4(decoded[4 * j], decoded[4 * j + 1], decoded[4 * j + 2], decoded[4 * j + 3]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto lo = tensor(rows + k0, dextents<int32_t, 2>(NK, live_lo), array<int, 2>({1, int(p.k)}));
+        mm.run(lo, tA, c0);
+        if (has_hi) {
+            auto hi = tensor(rows + ulong(NR1 / 2) * p.k + k0, dextents<int32_t, 2>(NK, live_hi),
+                             array<int, 2>({1, int(p.k)}));
+            mm.run(hi, tA, c1);
+        }
+    }
+    // Staging the FP32 results in the threadgroup block (the weight stage is spent), so each
+    // route's row leaves in coalesced stores.
+    threadgroup float *staged = reinterpret_cast<threadgroup float *>(sa);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    c0.store(tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(staged, dextents<int32_t, 2>(NR0, NR1 / 2)));
+    if (has_hi)
+        c1.store(tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(
+            staged + NR0 * (NR1 / 2), dextents<int32_t, 2>(NR0, NR1 / 2)));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int j = int(tid / 32); j < live; j += 4) {
+        uint out = plan[base + 1 + tile_row + j];
+        for (uint i = tid % 32; i < uint(NR0); i += 32) {
+            uint col = n0 + i;
+            if (col >= p.n)
+                continue;
+            float value = staged[j * NR0 + i] + (p.has_bias ? float(bfloat(bias[expert * p.n + col])) : 0.0f);
+            reinterpret_cast<device bfloat *>(y)[ulong(out) * p.n + col] = bfloat(value);
         }
     }
 }
@@ -289,26 +353,24 @@ expert_up_tensor(const device uchar *uw [[buffer(0)]], const device uchar *gw [[
                  constant Matrix &p [[buffer(8)]], uint3 group [[threadgroup_position_in_grid]],
                  uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                  uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float shared[32 * 64];
+    threadgroup float shared[64 * 64];
     uint column_tiles = (p.n + 63) / 64;
     bool gate = group.x >= column_tiles;
     uint n0 = (group.x % column_tiles) * 64;
     Matrix q = p;
     // The up projection carries the model's +1 bias offset; the gate does not.
     q.has_bias = gate ? 1 : 2;
-    expert_mxfp4_tensor<true>(gate ? gw : uw, reinterpret_cast<const device uchar *>(x),
-                              reinterpret_cast<device uchar *>(gate ? gy : uy), gate ? gb : ub, ids, q,
-                              shared, group, tid, lane, sg, n0);
+    expert_mxfp4_up(gate ? gw : uw, reinterpret_cast<const device uchar *>(x),
+                    reinterpret_cast<device uchar *>(gate ? gy : uy), gate ? gb : ub, ids, q,
+                    shared, group, tid, lane, sg, n0);
 }
 
 [[kernel, max_total_threads_per_threadgroup(128)]] void
-expert_down_tensor(const device uchar *w [[buffer(0)]], const device bfloat *x [[buffer(1)]],
+expert_down_tensor(const device uchar *w [[buffer(0)]], device half *x [[buffer(1)]],
                    device bfloat *y [[buffer(2)]], const device float *bias [[buffer(3)]],
                    const device uint *ids [[buffer(4)]], constant Matrix &p [[buffer(5)]],
-                   uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                   uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float shared[32 * 64];
-    expert_mxfp4_tensor<false>(w, reinterpret_cast<const device uchar *>(x),
-                               reinterpret_cast<device uchar *>(y), bias, ids, p, shared, group, tid,
-                               lane, sg, group.x * 64);
+                   uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup half staged[64 * 64 * 2];
+    expert_mxfp4_down(w, reinterpret_cast<device uchar *>(x), reinterpret_cast<device uchar *>(y),
+                      bias, ids, p, staged, group, tid, group.x * 64);
 }

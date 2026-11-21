@@ -61,14 +61,16 @@ inline void decode_weights16(const device uchar *row, uint k, thread float *out)
             out[j] = float(scale * (int(lo | (hi << 4)) - 32));
         }
     } else if (weight_type == WeightFormat::F16 || weight_type == WeightFormat::Bf16) {
-        // Sixteen contiguous half-width coefficients: two 16-byte loads instead of scalar reads.
-        const device uint4 *packed = reinterpret_cast<const device uint4 *>(row + k * 2);
-        uint4 words[2] = {packed[0], packed[1]};
+        // Sixteen contiguous half-width coefficients in four packed loads: GGUF guarantees these
+        // tensors only two-byte alignment.
+        const device packed_ushort4 *packed = reinterpret_cast<const device packed_ushort4 *>(row + k * 2);
 #pragma unroll
-        for (uint j = 0; j < 16; ++j) {
-            uint bits = (words[j / 8][j % 8 / 2] >> (j % 2 * 16)) & 0xffffu;
-            out[j] = weight_type == WeightFormat::F16 ? float(as_type<half>(ushort(bits)))
-                                                      : as_type<float>(bits << 16);
+        for (uint j = 0; j < 4; ++j) {
+            ushort4 words = packed[j];
+#pragma unroll
+            for (uint i = 0; i < 4; ++i)
+                out[4 * j + i] = weight_type == WeightFormat::F16 ? float(as_type<half>(words[i]))
+                                                                  : as_type<float>(uint(words[i]) << 16);
         }
     } else {
 #pragma unroll

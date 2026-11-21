@@ -13,7 +13,6 @@ use bytemuck::{Pod, Zeroable, bytes_of};
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Gate {
     n: u32,
-    clipped: u32,
 }
 
 #[repr(C)]
@@ -78,20 +77,14 @@ impl ExpertPlan {
 }
 
 impl Bindings<'_> {
-    fn activate(&self, n: usize, clipped: bool) {
-        let p = Gate {
-            n: n as u32,
-            clipped: clipped as u32,
-        };
-        // Overwriting each consumed gate element after reading it.
+    /// Overwriting each consumed gate element after reading it.
+    fn activate(&self, n: usize) {
+        let p = Gate { n: n as u32 };
+        let gate = self.scratch.gate.at(0);
         dispatch(
             self.encoder,
             &self.kernels.pipelines.gate,
-            &[
-                self.scratch.gate.at(0),
-                self.scratch.up.at(0),
-                self.scratch.gate.at(0),
-            ],
+            &[gate, self.scratch.up.at(0), gate],
             bytes_of(&p),
             [n.div_ceil(256), 1, 1],
             256,
@@ -106,7 +99,7 @@ impl Bindings<'_> {
         self.prepare_norm_scales(&[&w.gate.matrix, &w.up.matrix], rows, 0..rows);
         w.gate.apply_norm(self, &s.gate, rows);
         w.up.apply_norm_concurrent(self, &s.up, rows);
-        self.activate(rows * ffn_width, false);
+        self.activate(rows * ffn_width);
         w.down.apply(self, s.gate.at(0), &s.projected, rows);
     }
 
@@ -122,7 +115,7 @@ impl Bindings<'_> {
         let e = self.encoder;
         let s = self.scratch;
         let pipelines = &plan.pipelines;
-        // Tensor tiles cover 32 routes per expert and skip their empty upper half.
+        // Tensor tiles cover 64 routes per expert and skip their empty upper half.
         let (route_plan, up, down) = (
             &pipelines.route_plan,
             &pipelines.up_tensor,
@@ -216,14 +209,28 @@ impl Bindings<'_> {
             ..plan.down
         };
         if rows > 1 {
-            self.activate(rows * ACTIVE_EXPERTS * plan.width(), true);
+            let routes = rows * ACTIVE_EXPERTS;
+            let activation = Matrix {
+                k: plan.width() as u32,
+                m: routes as u32,
+                ..plan.down
+            };
+            dispatch(
+                e,
+                &pipelines.activate,
+                &[s.gate.at(0), s.up.at(0), routing.plan.at(0), s.projected.at(0)],
+                bytes_of(&activation),
+                [(routes * plan.width()).div_ceil(256), 1, 1],
+                256,
+            );
+            // Half activations in `projected`; route-ordered results reuse the spent `gate`.
             dispatch_indirect(
                 e,
                 down,
                 &[
                     w.down.values.binding(),
-                    s.gate.at(0),
                     s.projected.at(0),
+                    s.gate.at(0),
                     w.down.bias.binding(),
                     routing.plan.binding(),
                 ],
@@ -252,10 +259,15 @@ impl Bindings<'_> {
             hidden: hidden as u32,
             batch: rows as u32,
         };
+        let routed = if rows > 1 {
+            s.gate.at(0)
+        } else {
+            s.projected.at(0)
+        };
         dispatch(
             e,
             &pipelines.sum,
-            &[s.projected.at(0), routing.prob.at(0), residual],
+            &[routed, routing.prob.at(0), residual],
             bytes_of(&p),
             [(rows * hidden).div_ceil(256), 1, 1],
             256,

@@ -63,8 +63,12 @@ impl Memory {
         let routing = Routing {
             ids: p.slot(routes, 4)?,
             prob: p.slot(routes, 4)?,
+            // Dispatch arguments, tiles, per-expert route lists, then sorted offsets and rows.
             plan: p.slot(
-                6 + 2 * (routes.div_ceil(16) + EXPERT_COUNT) + EXPERT_COUNT * (routes + 1),
+                6 + 2 * (routes.div_ceil(16) + EXPERT_COUNT)
+                    + EXPERT_COUNT * (routes + 1)
+                    + EXPERT_COUNT
+                    + routes,
                 4,
             )?,
         };

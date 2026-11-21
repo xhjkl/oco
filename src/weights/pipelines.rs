@@ -6,7 +6,7 @@ use crate::{
     tensor::WeightFormat,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{MTL4Compiler, MTL4CompilerDescriptor, MTLDevice};
+use objc2_metal::{MTL4Compiler, MTL4CompilerDescriptor, MTLDevice, MTLGPUFamily};
 use std::collections::HashMap;
 
 /// Compiled kernels, embedded at build time.
@@ -23,6 +23,17 @@ pub struct AttentionPipelines {
     pub wide: Option<Pipeline>,
     /// 32-query register-softmax tiles for bidirectional batches of 64-wide heads.
     pub block: Option<Pipeline>,
+    /// Tensor-operation prompt tiles for causal heads on Apple10 GPUs.
+    pub tensor: Option<Pipeline>,
+    /// Split-key single-query kernels for long histories, sharing each key across the query
+    /// heads of one KV head: `group` query heads per KV head.
+    pub split: Option<SplitAttention>,
+}
+
+pub struct SplitAttention {
+    pub partial: Pipeline,
+    pub merge: Pipeline,
+    pub group: usize,
 }
 
 pub struct GatedAttentionPipelines {
@@ -79,8 +90,11 @@ pub struct ElementwisePipelines {
 
 pub struct ExpertPipelines {
     pub router_logits: Pipeline,
-    /// Indirect plan of 32-route tiles per expert and the tensor-operation tiles it drives.
+    /// Indirect plan of 64-route tiles per expert, with expert-sorted row offsets, and the
+    /// tensor-operation tiles it drives.
     pub route_plan: Pipeline,
+    /// Clipped SwiGLU writing each route's half activations to its expert-sorted row.
+    pub activate: Pipeline,
     pub up_tensor: Pipeline,
     pub down_tensor: Pipeline,
     pub expand: Pipeline,
@@ -96,6 +110,8 @@ pub struct Builder {
     library: Library,
     compiler: Retained<ProtocolObject<dyn MTL4Compiler>>,
     cache: HashMap<(&'static str, WeightFormat, u32), Pipeline>,
+    /// Neural accelerators behind the Metal 4 tensor operations (Apple10 and later).
+    tensor: bool,
 }
 
 impl Builder {
@@ -108,6 +124,7 @@ impl Builder {
             compiler,
             library,
             cache: HashMap::new(),
+            tensor: gpu.device.supportsFamily(MTLGPUFamily::Apple10),
         })
     }
 
@@ -255,8 +272,11 @@ impl Builder {
         let vector_rows = match (kind, input, output) {
             (Q4_0 | Q4_1, _, _) => 4,
             (Q5K, 6144, 5120) => 4,
-            // Keeping tiny recurrent alpha/beta coefficients in FP32 across Qwen sizes.
-            (F32, _, 1..=128) => super::state::MAX_PREFILL_ROWS,
+            // Keeping tiny recurrent alpha/beta coefficients in FP32 across Qwen sizes; tensor
+            // GPUs batch them through exact FP32 staging.
+            (F32, _, 1..=128) if !(self.tensor && input.is_multiple_of(64)) => {
+                super::state::MAX_PREFILL_ROWS
+            }
             (Q8_0, 2880, 512) => 128,
             (Q8_0, 2880, 4096) => 4,
             (Q8_0, 4096, 2880) => 4,
@@ -274,6 +294,31 @@ impl Builder {
         let column_groups = output.div_ceil(64);
         let plan = if vector_rows >= super::state::MAX_PREFILL_ROWS {
             DensePlan::Vector(vector)
+        } else if self.tensor && input.is_multiple_of(64) {
+            let tile = |builder: &mut Self, symbol: &'static str, rows: usize| -> Result<Tile> {
+                Ok(Tile {
+                    pipeline: builder.get(symbol, kind, 0)?,
+                    column_groups,
+                    rows,
+                })
+            };
+            let [narrow, middle, wide] = match kind {
+                F32 => ["matmul_tensor_f32_32", "matmul_tensor_f32_64", "matmul_tensor_f32_128"],
+                _ => ["matmul_tensor_32", "matmul_tensor_64", "matmul_tensor_128"],
+            };
+            DensePlan::Tensor {
+                vector,
+                vector_rows,
+                tiles: [
+                    tile(self, narrow, 32)?,
+                    tile(self, middle, 64)?,
+                    tile(self, wide, 128)?,
+                ],
+                sum: match kind {
+                    Q8_0 => None,
+                    _ => Some(self.get("matmul_split_sum", F32, 0)?),
+                },
+            }
         } else {
             let tile = |builder: &mut Self, variant: u32, rows: usize| -> Result<Tile> {
                 Ok(Tile {
@@ -349,12 +394,39 @@ impl Builder {
         } else {
             None
         };
+        let tensor = match dim {
+            64 => Some("attention_tensor_64"),
+            128 => Some("attention_tensor_128"),
+            256 => Some("attention_tensor_256"),
+            _ => None,
+        };
+        let tensor = match tensor {
+            Some(symbol) if self.tensor && !bidirectional => Some(self.get(symbol, F32, 0)?),
+            _ => None,
+        };
+        // Measured on M5 Pro: Qwen3.8's six and GPT-OSS's eight query heads per KV head gain
+        // from shared keys at long histories; Nemotron's sixteen lose to the vector kernel.
+        let split = match dim {
+            256 if !bidirectional => Some((6, "attention_split_256_6", "attention_merge_256")),
+            64 if !bidirectional => Some((8, "attention_split_64_8", "attention_merge_64")),
+            _ => None,
+        };
+        let split = match split {
+            Some((group, partial, merge)) => Some(SplitAttention {
+                partial: self.get(partial, F32, 0)?,
+                merge: self.get(merge, F32, 0)?,
+                group,
+            }),
+            None => None,
+        };
         Ok(AttentionPipelines {
             rope,
             vector,
             tiled,
             wide,
             block,
+            tensor,
+            split,
         })
     }
 
@@ -370,7 +442,7 @@ impl Builder {
         let conv = self.get("conv", F32, 0)?;
         let delta = self.get("delta", F32, 0)?;
         let delta_prepare = self.get("delta_prepare", F32, 0)?;
-        let delta_persistent = self.get("delta_persistent", F32, 0)?;
+        let delta_persistent = self.get("delta_persistent_4", F32, 0)?;
         let delta_output = self.get("delta_output", F32, 0)?;
         Ok(RecurrentPipelines {
             conv,
@@ -383,7 +455,8 @@ impl Builder {
 
     pub fn experts(&mut self) -> Result<ExpertPipelines> {
         use WeightFormat::{F32, Mxfp4};
-        let route_plan = self.get("route_plan", F32, 0)?;
+        let route_plan = self.get("route_plan_64", F32, 0)?;
+        let activate = self.get("moe_activate", F32, 0)?;
         let up_tensor = self.get("expert_up_tensor", Mxfp4, 0)?;
         let down_tensor = self.get("expert_down_tensor", Mxfp4, 0)?;
         let expand = self.get("expert_expand", F32, 0)?;
@@ -394,6 +467,7 @@ impl Builder {
         Ok(ExpertPipelines {
             router_logits,
             route_plan,
+            activate,
             up_tensor,
             down_tensor,
             expand,
@@ -407,7 +481,7 @@ impl Builder {
         use WeightFormat::{F32, Q4_0};
         Ok(NemotronPipelines {
             conv: self.get("ssm_conv", F32, 0)?,
-            scan: self.get("mamba_scan", F32, 0)?,
+            scan: self.get("mamba_scan_4", F32, 0)?,
             gate_norm: self.get("mamba_gate_norm", F32, 0)?,
             router: self.get("router_sigmoid", F32, 0)?,
             relu_sqr: self.get("relu_sqr", F32, 0)?,

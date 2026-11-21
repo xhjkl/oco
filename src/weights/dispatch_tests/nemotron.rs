@@ -206,7 +206,7 @@ fn mamba_block_matches_reference_across_chunking() -> Result<()> {
                         (&scanned_buffer, (GUARD + start * inner) * 4),
                     ],
                     bytemuck::bytes_of(&p),
-                    [head_dim.div_ceil(4), heads, 1],
+                    [head_dim.div_ceil(16), heads, 1],
                     128,
                 );
                 dispatch(

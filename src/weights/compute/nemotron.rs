@@ -13,6 +13,9 @@ use crate::weights::{
 use bytemuck::{Pod, Zeroable, bytes_of};
 use std::ops::Range;
 
+/// Channels each mamba_scan SIMD group carries; matches the pipeline's specialization.
+const SCAN_ROWS: usize = 4;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Ssm {
@@ -250,7 +253,7 @@ impl Bindings<'_> {
                 s.scanned.at(0),
             ],
             bytes_of(&p),
-            [plan.head_dim().div_ceil(4), plan.heads(), 1],
+            [plan.head_dim().div_ceil(4 * SCAN_ROWS), plan.heads(), 1],
             128,
         );
         if output.is_empty() {

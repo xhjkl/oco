@@ -66,37 +66,24 @@ kernel void add(device bfloat *x [[buffer(0)]], const device bfloat *y [[buffer(
 }
 struct Gate {
     uint n;
-    uint clipped;
 };
 kernel void gate(const device bfloat *g [[buffer(0)]], const device bfloat *u [[buffer(1)]],
                  device bfloat *y [[buffer(2)]], constant Gate &p [[buffer(3)]],
                  uint i [[thread_position_in_grid]]) {
     if (i >= p.n)
         return;
-    float a = p.clipped ? reinterpret_cast<const device float *>(g)[i] : float(g[i]);
-    float b = p.clipped ? reinterpret_cast<const device float *>(u)[i] : float(u[i]);
-    // Rejecting invalid operands before min/clamp can turn NaN into a finite clipping bound.
+    float a = float(g[i]), b = float(u[i]);
+    // Rejecting invalid operands keeps them invalid through the activation.
     if ((as_type<uint>(a) & 0x7f800000u) == 0x7f800000u ||
         (as_type<uint>(b) & 0x7f800000u) == 0x7f800000u) {
-        float invalid = as_type<float>(0x7fc00000u);
-        if (p.clipped)
-            reinterpret_cast<device float *>(y)[i] = invalid;
-        else
-            y[i] = bfloat(invalid);
+        y[i] = bfloat(as_type<float>(0x7fc00000u));
         return;
     }
-    if (p.clipped) {
-        a = min(a, 7.0f);
-        b = clamp(b, -6.0f, 8.0f);
-    }
-    float e = fast::exp(-abs(a) * (p.clipped ? 1.702f : 1.0f));
+    float e = fast::exp(-abs(a));
     // Dividing the negative tail directly; subtracting sigmoid(abs(a)) from one loses it.
     float sigmoid = (a < 0 ? e : 1.0f) / (1.0f + e);
     float activated = sigmoid * a;
-    if (p.clipped)
-        reinterpret_cast<device float *>(y)[i] = activated * b;
-    else
-        y[i] = bfloat(float(bfloat(activated)) * b);
+    y[i] = bfloat(float(bfloat(activated)) * b);
 }
 
 // Mean-centered normalization with learned gain and offset (audio encoders and Whisper).

@@ -27,9 +27,13 @@ kernel void ssm_conv(const device bfloat *x [[buffer(0)]], const device float *w
     state[c * 3 + 2] = d;
 }
 
-// Selective scan: one SIMD group owns one (head, channel) state row of 128 values, four per
-// lane, and walks the chunk in token order. The FP32 time steps pass through softplus after
-// their bias; A is stored negated in the checkpoint so the decay is exp(dt * A).
+// Selective scan: one SIMD group owns R (head, channel) state rows of 128 values, four per lane
+// per row, and walks the chunk in token order. The rows share the head's time step, decay and
+// B/C columns and run R independent chains, hiding each step's reduction latency. The FP32 time
+// steps pass through softplus after their bias; A is stored negated in the checkpoint so the
+// decay is exp(dt * A). Rows past the head width (odd widths) recompute the last valid channel
+// and are never stored.
+template <uint R>
 [[kernel, max_total_threads_per_threadgroup(128)]] void
 mamba_scan(const device float *xbc [[buffer(0)]], const device float *dt_in [[buffer(1)]],
            const device float *a [[buffer(2)]], const device float *d [[buffer(3)]],
@@ -37,15 +41,20 @@ mamba_scan(const device float *xbc [[buffer(0)]], const device float *dt_in [[bu
            device float *y [[buffer(6)]], constant Ssm &p [[buffer(7)]],
            uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
            uint sg [[simdgroup_index_in_threadgroup]]) {
-    uint h = group.y, ch = group.x * 4 + sg;
-    if (ch >= p.head_dim)
+    uint h = group.y, ch0 = (group.x * 4 + sg) * R;
+    if (ch0 >= p.head_dim)
         return;
     uint g = h / (p.heads / p.groups), inner = p.heads * p.head_dim;
-    uint row = (h * p.head_dim + ch) * p.state;
-    float s[4];
+    uint channels[R];
+    float s[R][4];
 #pragma unroll
-    for (uint j = 0; j < 4; j++)
-        s[j] = state[row + lane + 32 * j];
+    for (uint r = 0; r < R; r++) {
+        channels[r] = min(ch0 + r, p.head_dim - 1);
+        uint row = (h * p.head_dim + channels[r]) * p.state;
+#pragma unroll
+        for (uint j = 0; j < 4; j++)
+            s[r][j] = state[row + lane + 32 * j];
+    }
     float ah = a[h], dh = d[h], bias = dt_bias[h];
     const device float *bcol = xbc + inner + g * p.state;
     const device float *ccol = bcol + p.groups * p.state;
@@ -53,22 +62,44 @@ mamba_scan(const device float *xbc [[buffer(0)]], const device float *dt_in [[bu
         float dt = dt_in[t * p.heads + h] + bias;
         dt = dt <= 20.0f ? log(1.0f + exp(dt)) : dt;
         float decay = exp(dt * ah);
-        float xv = xbc[t * p.channels + h * p.head_dim + ch];
-        float xdt = xv * dt, acc = 0;
+        float bv[4], cv[4];
 #pragma unroll
         for (uint j = 0; j < 4; j++) {
             uint n = t * p.channels + lane + 32 * j;
-            s[j] = fma(s[j], decay, bcol[n] * xdt);
-            acc = fma(s[j], ccol[n], acc);
+            bv[j] = bcol[n];
+            cv[j] = ccol[n];
         }
-        acc = simd_sum(acc);
-        if (lane == 0)
-            y[t * inner + h * p.head_dim + ch] = fma(dh, xv, acc);
+        float xv[R], acc[R];
+#pragma unroll
+        for (uint r = 0; r < R; r++) {
+            xv[r] = xbc[t * p.channels + h * p.head_dim + channels[r]];
+            float xdt = xv[r] * dt;
+            acc[r] = 0;
+#pragma unroll
+            for (uint j = 0; j < 4; j++) {
+                s[r][j] = fma(s[r][j], decay, bv[j] * xdt);
+                acc[r] = fma(s[r][j], cv[j], acc[r]);
+            }
+            acc[r] = simd_sum(acc[r]);
+        }
+#pragma unroll
+        for (uint r = 0; r < R; r++)
+            if (lane == r && ch0 + r < p.head_dim)
+                y[t * inner + h * p.head_dim + ch0 + r] = fma(dh, xv[r], acc[r]);
     }
 #pragma unroll
-    for (uint j = 0; j < 4; j++)
-        state[row + lane + 32 * j] = s[j];
+    for (uint r = 0; r < R; r++)
+        if (ch0 + r < p.head_dim) {
+            uint row = (h * p.head_dim + ch0 + r) * p.state;
+#pragma unroll
+            for (uint j = 0; j < 4; j++)
+                state[row + lane + 32 * j] = s[r][j];
+        }
 }
+
+template [[host_name("mamba_scan_4")]] kernel void mamba_scan<4>(
+    const device float *, const device float *, const device float *, const device float *,
+    const device float *, device float *, device float *, constant Ssm &, uint2, uint, uint);
 
 // Gate the scan output with SiLU(z), then RMS-normalize each group of channels in FP32.
 [[kernel, max_total_threads_per_threadgroup(256)]] void

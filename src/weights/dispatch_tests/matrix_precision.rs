@@ -12,6 +12,8 @@ use half::{bf16, f16};
 
 #[path = "q4_prefill.rs"]
 mod q4_prefill;
+#[path = "tensor_prefill.rs"]
+mod tensor_prefill;
 
 /// Decode independently packed GGUF rows, including SIMD tails, before FP32 accumulation.
 #[test]

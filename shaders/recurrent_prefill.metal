@@ -49,7 +49,10 @@ kernel void delta_prepare(const device bfloat *qkv [[buffer(0)]],
     }
 }
 
-// Four SIMD groups own four value rows, retaining four state values per lane.
+// Four SIMD groups own R value rows each, retaining four state values per lane per row. The
+// rows of one SIMD group share the head's query and key loads and run R independent recurrence
+// chains, so fewer, longer-lived SIMD groups hide each step's reduction latency.
+template <uint R>
 kernel void delta_persistent(const device float *qk [[buffer(0)]],
                              const device float *metadata [[buffer(1)]],
                              const device bfloat *qkv [[buffer(2)]],
@@ -59,38 +62,67 @@ kernel void delta_persistent(const device float *qk [[buffer(0)]],
                              uint2 group [[threadgroup_position_in_grid]],
                              uint lane [[thread_index_in_simdgroup]],
                              uint sg [[simdgroup_index_in_threadgroup]]) {
-    uint hv = group.y, dv = group.x * 4 + sg;
-    if (dv >= p.vd)
+    uint hv = group.y, dv0 = (group.x * 4 + sg) * R;
+    if (dv0 >= p.vd)
         return;
     uint hk = hv % p.kh, keydim = p.kh * 128, vdim = p.vh * p.vd;
-    uint row = (hv * p.vd + dv) * 128;
-    float s[4];
-    for (uint j = 0; j < 4; ++j)
-        s[j] = state[row + lane + 32 * j];
+    // Rows past the head's value width (odd widths) recompute the last valid row, never stored.
+    uint rows[R];
+    float s[R][4];
+#pragma unroll
+    for (uint r = 0; r < R; ++r) {
+        rows[r] = min(dv0 + r, p.vd - 1);
+#pragma unroll
+        for (uint j = 0; j < 4; ++j)
+            s[r][j] = state[(hv * p.vd + rows[r]) * 128 + lane + 32 * j];
+    }
     for (uint t = 0; t < p.m; ++t) {
-        float q[4], k[4], sq = 0, sk = 0;
+        float q[4], k[4], sq[R], sk[R];
+#pragma unroll
         for (uint j = 0; j < 4; ++j) {
             uint index = t * 2 * keydim + hk * 128 + lane + 32 * j;
             q[j] = qk[index];
             k[j] = qk[index + keydim];
-            sq += s[j] * q[j];
-            sk += s[j] * k[j];
         }
-        sq = simd_sum(sq);
-        sk = simd_sum(sk);
         uint base = t * (2 * p.vh + p.kh);
         float decay = metadata[base + hv], be = metadata[base + p.vh + hv];
         float kq = metadata[base + 2 * p.vh + hk];
-        float v = float(qkv[t * p.conv_dim + 2 * keydim + hv * p.vd + dv]);
-        float change = be * (v - decay * sk);
-        for (uint j = 0; j < 4; ++j)
-            s[j] = decay * s[j] + k[j] * change;
-        if (lane == 0)
-            mixed[t * vdim + hv * p.vd + dv] = decay * sq + change * kq;
+        const device bfloat *v = qkv + t * p.conv_dim + 2 * keydim + hv * p.vd;
+#pragma unroll
+        for (uint r = 0; r < R; ++r) {
+            sq[r] = 0;
+            sk[r] = 0;
+#pragma unroll
+            for (uint j = 0; j < 4; ++j) {
+                sq[r] += s[r][j] * q[j];
+                sk[r] += s[r][j] * k[j];
+            }
+            sq[r] = simd_sum(sq[r]);
+            sk[r] = simd_sum(sk[r]);
+        }
+#pragma unroll
+        for (uint r = 0; r < R; ++r) {
+            float change = be * (float(v[rows[r]]) - decay * sk[r]);
+#pragma unroll
+            for (uint j = 0; j < 4; ++j)
+                s[r][j] = decay * s[r][j] + k[j] * change;
+            if (lane == r && dv0 + r < p.vd)
+                mixed[t * vdim + hv * p.vd + dv0 + r] = decay * sq[r] + change * kq;
+        }
     }
-    for (uint j = 0; j < 4; ++j)
-        state[row + lane + 32 * j] = s[j];
+#pragma unroll
+    for (uint r = 0; r < R; ++r)
+        if (dv0 + r < p.vd)
+#pragma unroll
+            for (uint j = 0; j < 4; ++j)
+                state[(hv * p.vd + dv0 + r) * 128 + lane + 32 * j] = s[r][j];
 }
+
+#define DELTA_PERSISTENT(R)                                                                        \
+    template [[host_name("delta_persistent_" #R)]] kernel void delta_persistent<R>(                \
+        const device float *, const device float *, const device bfloat *, device float *,         \
+        device float *, constant Gdn &, uint2, uint, uint);
+DELTA_PERSISTENT(4)
 
 kernel void delta_output(const device float *mixed [[buffer(0)]],
                          const device bfloat *z [[buffer(1)]],

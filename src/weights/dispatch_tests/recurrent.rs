@@ -245,7 +245,7 @@ fn run_chunks(
                         (&scratch[2], GUARD * 4),
                     ],
                     bytemuck::bytes_of(&params),
-                    [vd.div_ceil(4), vh, 1],
+                    [vd.div_ceil(16), vh, 1],
                     128,
                 );
                 dispatch(

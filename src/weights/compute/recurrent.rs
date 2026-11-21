@@ -8,6 +8,9 @@ use crate::weights::{
 use bytemuck::{Pod, Zeroable, bytes_of};
 use std::ops::Range;
 
+/// Value rows each delta_persistent SIMD group carries; matches the pipeline's specialization.
+const DELTA_ROWS: usize = 4;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Gdn {
@@ -162,7 +165,7 @@ impl Bindings<'_> {
                     s.values.at(0),
                 ],
                 bytes_of(&p),
-                [(p.vd as usize).div_ceil(4), plan.heads(), 1],
+                [(p.vd as usize).div_ceil(4 * DELTA_ROWS), plan.heads(), 1],
                 128,
             );
             if output.is_empty() {

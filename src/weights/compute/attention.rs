@@ -420,8 +420,9 @@ impl Bindings<'_> {
     }
 
     /// Score `p.m` query rows against the stored keys and write the mixed rows. Single queries
-    /// take the one-pass vector kernel at every history length: splitting the keys across
-    /// threadgroups measured slower at 1k-32k keys for both checkpoints' head geometries.
+    /// take the one-pass vector kernel below 16k visible keys; beyond that, the split kernel
+    /// shares each key across one KV head's query heads (measured on M5 Pro for Qwen3.8's and
+    /// GPT-OSS's geometries). Prompts take the tensor tiles on Apple10 GPUs.
     fn attend(
         &self,
         plan: &AttentionPlan,
@@ -441,6 +442,35 @@ impl Bindings<'_> {
         let pipelines = &plan.pipelines;
         // Other rows take one vector threadgroup per head and row: for Qwen3.8's 256-wide heads
         // it measured 1.6-6x faster than query tiles at 8-512 rows over 0-8k keys of history.
+        // Single queries over at least 16k visible keys split them into 32 chunks per KV head.
+        let visible = p.pos as usize + 1;
+        let visible = if window > 0 { visible.min(window) } else { visible };
+        let chunks = 32;
+        if let Some(split) = pipelines.split.as_ref().filter(|split| {
+            m == 1
+                && p.keys == 0
+                && visible >= 16384
+                && heads == split.group * p.kv_heads as usize
+                && chunks * heads * (p.dim as usize + 2) * 4 <= self.scratch.partials.length()
+        }) {
+            let partials = self.scratch.partials.binding();
+            let buffers = [q, state.k.binding(), state.v.binding(), sinks, partials];
+            let groups = [p.kv_heads as usize, chunks, 1];
+            dispatch(e, &split.partial, &buffers, bytes_of(&p), groups, 256);
+            // The merge reads the chunk count from `m`, which a single query leaves free.
+            let merge = AttentionParams {
+                m: chunks as u32,
+                ..p
+            };
+            let buffers = [partials, sinks, s.mixed.at(0)];
+            dispatch(e, &split.merge, &buffers, bytes_of(&merge), [heads, 1, 1], 256);
+            return;
+        }
+        if let Some(pipeline) = pipelines.tensor.as_ref().filter(|_| p.keys == 0 && m >= 16) {
+            let buffers = [q, state.k.binding(), state.v.binding(), sinks, s.mixed.at(0)];
+            dispatch(e, pipeline, &buffers, bytes_of(&p), [heads, m.div_ceil(32), 1], 256);
+            return;
+        }
         let (pipeline, threads, groups) =
             match (&pipelines.block, &pipelines.wide, &pipelines.tiled) {
                 // Bidirectional batches share every key across all rows; the block tiles amortize them.

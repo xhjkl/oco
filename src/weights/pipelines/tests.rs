@@ -17,7 +17,8 @@ fn small_f32_projections_preserve_tiny_coefficients_across_model_sizes() -> Resu
     let mut builder = Builder::new(&gpu)?;
     let coefficient = 2.0f32.powi(-30);
     assert_eq!(f16::from_f32(coefficient).to_f32(), 0.0);
-    for (k, n, m) in [(1024usize, 16usize, 2usize), (6144, 128, 9), (64, 129, 2)] {
+    // K = 96 is not a whole number of tensor steps, so tensor GPUs keep its vector rows too.
+    for (k, n, m) in [(1024usize, 16usize, 2usize), (6144, 128, 9), (96, 48, 3), (64, 129, 2)] {
         let mut coefficients = vec![0.0f32; k * n];
         for column in 0..n {
             coefficients[column * k + (column * 31) % k] = coefficient;
@@ -32,18 +33,33 @@ fn small_f32_projections_preserve_tiny_coefficients_across_model_sizes() -> Resu
         let tensor = Tensor::bound(storage, WeightFormat::F32, &[k, n])?;
         let matrix = builder.dense(tensor)?;
         if n > 128 {
-            assert!(matches!(matrix.plan, DensePlan::Tiled { .. }));
+            assert!(matches!(
+                matrix.plan,
+                DensePlan::Tiled { .. } | DensePlan::Tensor { .. }
+            ));
             continue;
         }
-        let DensePlan::Vector(vector) = &matrix.plan else {
-            panic!("F32 {k}x{n} must not round tiny coefficients through FP16");
+        // Exact FP32 vector rows, or on tensor GPUs FP32-staged tensor tiles.
+        let (pipeline, groups, threads) = match &matrix.plan {
+            DensePlan::Vector(vector) => {
+                assert_eq!(vector.column_groups, n);
+                let expected = &builder.cache[&("matvec_split", WeightFormat::F32, 0)];
+                assert_eq!(
+                    Retained::as_ptr(&vector.pipeline),
+                    Retained::as_ptr(expected)
+                );
+                (&vector.pipeline, [vector.column_groups, m, 1], 256)
+            }
+            DensePlan::Tensor { tiles, .. } => {
+                let expected = &builder.cache[&("matmul_tensor_f32_32", WeightFormat::F32, 0)];
+                assert_eq!(
+                    Retained::as_ptr(&tiles[0].pipeline),
+                    Retained::as_ptr(expected)
+                );
+                (&tiles[0].pipeline, [m.div_ceil(32), tiles[0].column_groups, 1], 128)
+            }
+            _ => panic!("F32 {k}x{n} must not round tiny coefficients through FP16"),
         };
-        assert_eq!(vector.column_groups, n);
-        let expected_pipeline = &builder.cache[&("matvec_split", WeightFormat::F32, 0)];
-        assert_eq!(
-            Retained::as_ptr(&vector.pipeline),
-            Retained::as_ptr(expected_pipeline)
-        );
         let input: Vec<_> = (0..m * k)
             .map(|i| bf16::from_f32(((i * 17 + i / k * 5) % 61) as f32 / 32.0 - 0.875).to_bits())
             .collect();
@@ -68,7 +84,7 @@ fn small_f32_projections_preserve_tiny_coefficients_across_model_sizes() -> Resu
         let submission = compute.submit(|encoder| {
             dispatch(
                 encoder,
-                &vector.pipeline,
+                pipeline,
                 &[
                     matrix.values.binding(),
                     (&input, 0),
@@ -77,8 +93,8 @@ fn small_f32_projections_preserve_tiny_coefficients_across_model_sizes() -> Resu
                     (&ids, 0),
                 ],
                 bytemuck::cast_slice(&params),
-                [vector.column_groups, m, 1],
-                256,
+                groups,
+                threads,
             );
         });
         futures_lite::future::block_on(submission)?;

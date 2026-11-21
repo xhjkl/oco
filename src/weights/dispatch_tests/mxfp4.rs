@@ -346,8 +346,8 @@ fn check_experts(
         .flat_map(|token| [31, (token % 15) as u32, 15 + (token % 8) as u32, 30])
         .collect();
     let routing = buffer(gpu, &ids);
-    let mut plan =
-        vec![SENTINEL; (6 + 2 * (routes.div_ceil(16) + 32) + 32 * (routes + 1)) + 2 * GUARD];
+    let plan_words = 6 + 2 * (routes.div_ceil(16) + 32) + 32 * (routes + 1) + 32 + routes;
+    let mut plan = vec![SENTINEL; plan_words + 2 * GUARD];
     let route_plan = buffer(gpu, &plan);
     let mut up = vec![SENTINEL; routes * n + 2 * GUARD];
     let mut gate = up.clone();
@@ -393,12 +393,29 @@ fn check_experts(
             (&route_plan, GUARD * 4),
             128,
         );
+    });
+    futures_lite::future::block_on(submission)?;
+    read(&uy, &mut up);
+    read(&route_plan, &mut plan);
+    // The down tiles consume half activations in expert-sorted rows; feed them the up
+    // projections rounded as the activation pass rounds its output, at each route's row.
+    let rows_base = 6 + 2 * (routes.div_ceil(16) + 32) + 32 * (routes + 1) + 32;
+    let mut activations = vec![0u16; routes * n];
+    for route in 0..routes {
+        let row = plan[GUARD + rows_base + route] as usize;
+        for column in 0..n {
+            let value = f32::from_bits(up[GUARD + route * n + column]);
+            activations[row * n + column] = half::f16::from_f32(value).to_bits();
+        }
+    }
+    let activations = buffer(gpu, &activations);
+    let submission = compute.submit(|encoder| {
         dispatch_indirect(
             encoder,
             down_pipeline,
             &[
                 (&down_weight, WEIGHT_OFFSET),
-                (&uy, GUARD * 4),
+                (&activations, 0),
                 (&dy, GUARD * 2),
                 (&db, 0),
                 (&route_plan, GUARD * 4),
@@ -409,7 +426,6 @@ fn check_experts(
         );
     });
     futures_lite::future::block_on(submission)?;
-    read(&uy, &mut up);
     read(&gy, &mut gate);
     read(&dy, &mut down);
     read(&route_plan, &mut plan);
