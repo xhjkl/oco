@@ -1,15 +1,16 @@
 # ⚫️ oco
 
-Oco runs Qwen, gpt-oss, and Whisper on Apple Silicon, in Rust and Metal, and very little else.
-Serving so few architectures is the point: every kernel is written for the model it runs.
+`oco` is an inference engine for Apple Silicon, written in Rust and Metal. It generates text
+with Qwen, gpt-oss, and Nemotron, transcribes speech with Whisper and Qwen3-ASR, and runs
+nothing else. Supporting so few kinds of model is by design: it lets every kernel be written
+for a layer and a weight format that one of these models actually uses.
 
-From the same GGUF, it generates gpt-oss-20b tokens 22% faster than llama.cpp and Qwen3.8-27B
-tokens 5% faster; it transcribes long recordings 11% faster than whisper.cpp at the same
-accuracy. An agent's next turn costs only its new tokens: a session rewinds to where the
-conversation diverged, and a saved prompt reopens in milliseconds instead of being read again.
+From the same GGUF file, `oco` generates tokens 22% faster than llama.cpp with gpt-oss-20b
+and 5% faster with Qwen3.8-27B. It transcribes long recordings 11% faster than whisper.cpp
+at the same accuracy.
 
 ```rust,no_run
-# async fn example() -> anyhow::Result<()> {
+# async fn example() -> oco::Result<()> {
 let weights = oco::load("model.gguf")?;
 let tokenizer = weights.tokenizer();
 let prompt = tokenizer.encode("Three useful shell commands for inspecting log files are:\n1.")?;
@@ -26,8 +27,11 @@ println!("{}", decoder.finish());
 # }
 ```
 
-`infer` appends to what a session already holds. `rewind` returns to an earlier position,
-`checkpoint` keeps that cheap for recurrent layers, and `save` with `open_session` carries a
-prefilled prompt across processes. The tokenizer and special tokens come from the checkpoint.
+A session can be rewound, or saved to disk and restored later, so a long prompt need not be
+processed twice.
 
-Runnable programs live in [examples](examples): `cargo run --release --example NAME -- ARGS`.
+Start exploring with the [examples](examples):
+
+```sh
+cargo run --release --example infer -- model.gguf "Why is the sky blue?"
+```
