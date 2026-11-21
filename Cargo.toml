@@ -7,7 +7,6 @@ license = "MIT"
 description = "An inference engine"
 
 [dependencies]
-anyhow = "1"
 block2 = "0.6"
 bytemuck = { version = "1", features = ["derive"] }
 dispatch2 = "0.3.1"
@@ -17,6 +16,7 @@ memmap2 = "0.9"
 objc2 = "0.6"
 objc2-foundation = "0.3.2"
 objc2-metal = "0.3.2"
+thiserror = "2"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 
 [dev-dependencies]
