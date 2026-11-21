@@ -235,6 +235,106 @@ fn cancelled_prefill_and_decode_remain_unusable_after_gpu_completion() -> Result
     })
 }
 
+#[test]
+fn history_tracks_consumed_ids_through_dropped_pulls_and_a_full_context() -> Result<()> {
+    block_on(async {
+        let weights = weights(1.0)?;
+        let mut session = Session::new(&weights, 4)?;
+        let mut inference = session.infer(vec![1, 0])?;
+        let first = inference.next().await?.expect("prediction");
+        let second = inference.next().await?.expect("prediction");
+        // An unpolled pull consumes nothing.
+        drop(inference.next());
+        drop(inference);
+        assert_eq!(session.history(), [1, 0, first]);
+        let mut inference = session.infer(vec![second])?;
+        assert!(inference.next().await?.is_some());
+        assert_eq!(inference.next().await?, None, "the context is full");
+        drop(inference);
+        assert_eq!(session.history(), [1, 0, first, second]);
+        assert_eq!(session.position()?, 4);
+        Ok(())
+    })
+}
+
+#[test]
+fn rewind_keeps_a_prefix_and_rejects_positions_past_the_history() -> Result<()> {
+    block_on(async {
+        let weights = weights(1.0)?;
+        let mut session = Session::new(&weights, 8)?;
+        let mut inference = session.infer(vec![1, 0, 1])?;
+        let prediction = inference.next().await?.expect("prediction");
+        drop(inference);
+        assert!(session.rewind(4).is_err());
+        assert_eq!(session.history(), [1, 0, 1]);
+        session.rewind(1)?;
+        assert_eq!(session.history(), [1]);
+        let mut inference = session.infer(vec![0, 1])?;
+        assert_eq!(inference.next().await?, Some(prediction));
+        drop(inference);
+        session.rewind(0)?;
+        assert!(session.history().is_empty());
+
+        let broken = self::weights(f32::NAN)?;
+        let mut session = Session::new(&broken, 4)?;
+        let mut inference = session.infer(vec![1])?;
+        assert!(inference.next().await.is_err());
+        drop(inference);
+        assert!(
+            session.rewind(0).is_err(),
+            "an unusable session cannot rewind"
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn saved_contexts_round_trip_and_unreadable_files_are_refused() -> Result<()> {
+    block_on(async {
+        let weights = weights(1.0)?;
+        let directory = std::env::temp_dir();
+        let path = directory.join(format!("oco-context-{}.ctx", std::process::id()));
+        let mut session = Session::new(&weights, 8)?;
+        let mut inference = session.infer(vec![1, 0])?;
+        let prediction = inference.next().await?.expect("prediction");
+        drop(inference);
+        session.save(&path)?;
+        let mut opened = Session::open(&weights, &path, 8)?;
+        assert_eq!(opened.history(), session.history());
+        let mut original = session.infer(vec![prediction])?;
+        let mut restored = opened.infer(vec![prediction])?;
+        assert_eq!(restored.next().await?, original.next().await?);
+        drop((original, restored));
+        assert!(
+            Session::open(&weights, &path, 1).is_err(),
+            "history exceeds capacity"
+        );
+
+        // Sessions saving the same path concurrently each publish a complete file.
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..8 {
+                        session.save(&path).expect("concurrent save");
+                    }
+                });
+            }
+        });
+        let bytes = std::fs::read(&path)?;
+        // Counts that would overrun the buffers, and a file too short for what it claims.
+        let mut damaged = bytes.clone();
+        damaged[0] ^= 0x40;
+        std::fs::write(&path, &damaged)?;
+        assert!(Session::open(&weights, &path, 8).is_err(), "consumed count");
+        std::fs::write(&path, &bytes[..bytes.len() - 1])?;
+        assert!(Session::open(&weights, &path, 8).is_err(), "truncated");
+        std::fs::write(&path, &bytes)?;
+        assert!(Session::open(&weights, &path, 8).is_ok());
+        std::fs::remove_file(&path)?;
+        Ok(())
+    })
+}
+
 /// Build an embedding/output graph for submission lifecycle tests.
 /// Empty transformer layers keep these tests independent of model arithmetic.
 fn weights(output_coefficient: f32) -> Result<Architecture> {

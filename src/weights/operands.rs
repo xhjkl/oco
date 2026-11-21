@@ -57,6 +57,10 @@ pub enum DensePlan {
         narrow: [Tile; 4],
         /// 64-row tiles for whole multiples of 64 rows.
         wide: Tile,
+        /// Finishes narrow tiles whose K range was split across threadgroups. Absent for Q8_0
+        /// (GPT-OSS's projections), whose references lose agreement on near-tied tokens when
+        /// the sums are reordered.
+        sum: Option<Pipeline>,
     },
 }
 

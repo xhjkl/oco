@@ -3,7 +3,10 @@ use crate::gpu::BufferView;
 use anyhow::{Result, anyhow, bail, ensure};
 use compute::{Bindings, Compute};
 use state::*;
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
+
+mod saved;
+
 /// Mutable sequence state and scratch storage sharing immutable model weights.
 ///
 /// Attention caches and recurrent memories retain consumed context across inference
@@ -17,13 +20,26 @@ pub struct Session {
     prefill_rows: usize,
     /// Audio feature rows filled so far; IDs `vocabulary..vocabulary + features` select them.
     pub(super) features: usize,
+    /// Consumed IDs, including any a rewind left for the next prefill to replay.
+    history: Vec<u32>,
+    /// Retained recurrent memories, oldest first: the earliest and the most recent.
+    checkpoints: Vec<Checkpoint>,
 }
 
 /// Host access permission for mutable GPU state, restored only after a validated completion.
 enum Progress {
-    Empty,
-    Ready { position: usize },
+    /// GPU state holds the first `resident` IDs of the history; later ones await replay.
+    Ready {
+        resident: usize,
+    },
     Unusable,
+}
+
+/// Recurrent memory copied at a history position, so rewinding there needs no replay.
+/// Attention-only models keep just the position; their caches rewind in place.
+struct Checkpoint {
+    position: usize,
+    state: Vec<u8>,
 }
 
 /// Immutable weights and mutable memory paired by layout so every layer receives the state it expects.
@@ -100,10 +116,12 @@ impl Session {
         Ok(Self {
             compute,
             inner,
-            progress: Progress::Empty,
+            progress: Progress::Ready { resident: 0 },
             capacity,
             prefill_rows,
             features: 0,
+            history: Vec::new(),
+            checkpoints: Vec::new(),
         })
     }
 
@@ -164,19 +182,34 @@ impl Session {
     /// Count consumed tokens, excluding the last emitted prediction.
     /// Return an error if incomplete GPU work left the state unusable.
     pub fn position(&self) -> Result<usize> {
+        self.resident()?;
+        Ok(self.history.len())
+    }
+
+    /// Consumed input IDs, oldest first. The last emitted prediction is not among them.
+    pub fn history(&self) -> &[u32] {
+        &self.history
+    }
+
+    /// Count the consumed tokens the GPU state already holds.
+    fn resident(&self) -> Result<usize> {
         match self.progress {
             Progress::Unusable => Err(anyhow!("session is unusable; create a new session")),
-            Progress::Empty => Ok(0),
-            Progress::Ready { position, .. } => Ok(position),
+            Progress::Ready { resident } => Ok(resident),
         }
     }
 
-    /// Consume input already validated by `infer` and predict its successor.
+    /// Consume input already validated by `infer`, after any IDs a rewind left to replay,
+    /// and predict its successor.
     pub(super) async fn prefill(&mut self, tokens: &[u32]) -> Result<u32> {
-        let mut position = self.position()?;
+        let mut position = self.resident()?;
+        let input = match &self.history[position..] {
+            [] => Cow::Borrowed(tokens),
+            replay => Cow::Owned([replay, tokens].concat()),
+        };
         // Invalidating before submission; cancellation cannot expose abandoned mutable buffers.
         self.progress = Progress::Unusable;
-        let mut chunks = tokens.chunks(self.prefill_rows).peekable();
+        let mut chunks = input.chunks(self.prefill_rows).peekable();
         while let Some(chunk) = chunks.next() {
             let scratch = self.common().1;
             scratch.input.write(0, chunk);
@@ -188,17 +221,22 @@ impl Session {
                 .await?;
             position += chunk.len();
         }
+        self.history.extend_from_slice(tokens);
         self.accept_prediction(position)
     }
 
-    /// Feed back the GPU-resident prediction and return its successor.
-    pub(super) async fn decode(&mut self) -> Result<u32> {
-        let position = self.position()?;
-        ensure!(position > 0, "decode requires a prefilled session");
+    /// Feed back the GPU-resident prediction `token` and return its successor.
+    pub(super) async fn decode(&mut self, token: u32) -> Result<u32> {
+        let position = self.resident()?;
+        ensure!(
+            position > 0 && position == self.history.len(),
+            "decode requires a prefilled session"
+        );
         ensure!(position < self.capacity, "context capacity exceeded");
         self.progress = Progress::Unusable;
         self.forward(&self.common().1.next, position..position + 1, Some(0))
             .await?;
+        self.history.push(token);
         self.accept_prediction(position + 1)
     }
 
@@ -212,34 +250,132 @@ impl Session {
             (selected as usize) < self.vocabulary_size(),
             "non-finite logits produced no valid token"
         );
-        self.progress = Progress::Ready { position };
+        self.progress = Progress::Ready { resident: position };
         Ok(selected)
     }
 
-    /// Forget the sequence and reuse its allocated storage for an unrelated prompt.
+    /// Forget the sequence and its checkpoints and reuse the storage for an unrelated prompt.
     ///
     /// Capacity and scratch size stay fixed, and predictions become unavailable
     /// until the next prefill. Reset is allowed only for healthy idle sessions;
     /// it cannot recover one whose GPU work failed or was cancelled.
     pub fn reset(&mut self) -> Result<()> {
-        let position = self.position()?;
+        self.resident()?;
+        self.checkpoints.clear();
+        self.rewind(0)?;
         self.features = 0;
-        if position == 0 {
+        Ok(())
+    }
+
+    /// Keep only the first `position` consumed tokens; the next `infer` continues after them.
+    ///
+    /// Attention caches rewind in place. Recurrent memory returns to the newest checkpoint at
+    /// or before `position` (the empty sequence always counts as one), and the next `infer`
+    /// re-consumes the retained IDs between that checkpoint and `position` before its own
+    /// input. Checkpoints past `position` are forgotten.
+    pub fn rewind(&mut self, position: usize) -> Result<()> {
+        let resident = self.resident()?;
+        ensure!(
+            position <= self.history.len(),
+            "cannot rewind past the consumed context"
+        );
+        self.history.truncate(position);
+        self.checkpoints.retain(|c| c.position <= position);
+        if position >= resident {
             return Ok(());
         }
-        // Forgetting the KV prefix by position; recurrent memory must be zeroed because
-        // every update reads it regardless of the new sequence's length.
-        let recurrent: &[Recurrence] = match &self.inner {
+        let resident = match self.recurrent() {
+            [] => position,
+            recurrent => match self.checkpoints.last() {
+                Some(checkpoint) => {
+                    self.restore(&checkpoint.state);
+                    checkpoint.position
+                }
+                // Restoring the empty sequence, whose memory is all zeros.
+                None => {
+                    recurrent.iter().for_each(Recurrence::reset);
+                    0
+                }
+            },
+        };
+        self.progress = Progress::Ready { resident };
+        Ok(())
+    }
+
+    /// Remember recurrent memory at the current position so later rewinds to it, or past it,
+    /// replay nothing before it. A session retains its earliest and its most recent checkpoint.
+    /// Each is a host copy of all recurrent memory (about 150 MiB for Qwen3.8-27B, the same
+    /// bytes every saved context carries); attention-only models store nothing. The empty
+    /// sequence needs no checkpoint, so taking one there does nothing.
+    ///
+    /// To checkpoint a prompt without an extra forward pass, pull its first prediction, drop
+    /// the `Inference`, call this, and continue with `infer(vec![prediction])`: that prefill
+    /// does exactly the work of the decode step it replaces. With IDs still awaiting replay
+    /// after a rewind, the memory they start from is already retained and this does nothing.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        let position = self.resident()?;
+        if position == 0
+            || position < self.history.len()
+            || self
+                .checkpoints
+                .last()
+                .is_some_and(|c| c.position == position)
+        {
+            return Ok(());
+        }
+        // Reusing the replaced checkpoint's allocation for the same fixed-size memory.
+        let mut state = match self.checkpoints.len() {
+            2 => self.checkpoints.pop().map(|c| c.state).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let total = self.recurrent_views().map(BufferView::length).sum();
+        if state.len() != total {
+            state = vec![0; total];
+        }
+        let mut offset = 0;
+        for view in self.recurrent_views() {
+            let end = offset + view.length();
+            view.read(&mut state[offset..end]);
+            offset = end;
+        }
+        self.checkpoints.push(Checkpoint { position, state });
+        Ok(())
+    }
+
+    /// Per-layer attention history, in layer order.
+    fn kv(&self) -> &[Kv] {
+        match &self.inner {
+            Execution::QwenDelta { .. } => &[],
+            Execution::GptOss { memory, .. } => &memory.states,
+            Execution::QwenAttention { memory, .. } => &memory.states,
+            Execution::QwenHybrid { memory, .. } => &memory.kv_states,
+            Execution::Nemotron { memory, .. } => &memory.kv_states,
+        }
+    }
+
+    /// Recurrent memory buffers in checkpoint and saved-context order.
+    fn recurrent_views(&self) -> impl Iterator<Item = &BufferView> {
+        self.recurrent().iter().flat_map(|r| [&r.conv, &r.ssm])
+    }
+
+    /// Overwrite recurrent memory with `state`, laid out as [`Self::recurrent_views`].
+    fn restore(&self, state: &[u8]) {
+        let mut offset = 0;
+        for view in self.recurrent_views() {
+            let end = offset + view.length();
+            view.write(0, &state[offset..end]);
+            offset = end;
+        }
+    }
+
+    /// Per-layer recurrent memory, in layer order; empty for attention-only models.
+    fn recurrent(&self) -> &[Recurrence] {
+        match &self.inner {
             Execution::GptOss { .. } | Execution::QwenAttention { .. } => &[],
             Execution::QwenDelta { memory, .. } => &memory.states,
             Execution::QwenHybrid { memory, .. } => &memory.recurrent,
             Execution::Nemotron { memory, .. } => &memory.recurrent,
-        };
-        for state in recurrent {
-            state.reset();
         }
-        self.progress = Progress::Empty;
-        Ok(())
     }
 
     /// Consume the supplied sequence positions and optionally score one chunk-relative output row.

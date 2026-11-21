@@ -87,7 +87,7 @@ impl AudioScratch<Slot> {
             stage,
             tokens: p.slot(product(WINDOW_TOKENS, e.conv_out.matrix.input)?, 2)?,
             common: CommonScratch::plan(p, WINDOW_TOKENS, e.width, e.ffn_width, 1, 2, 1)?,
-            attention: AttentionScratch::plan(p, WINDOW_TOKENS, WINDOW_TOKENS, &e.attention)?,
+            attention: AttentionScratch::plan(p, WINDOW_TOKENS, &e.attention)?,
             kv: kv_states(p, 1, WINDOW_TOKENS, &e.attention)?,
         })
     }

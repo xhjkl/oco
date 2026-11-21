@@ -120,6 +120,3 @@ attention_block(const device bfloat *q [[buffer(0)]], const device half *k [[buf
 template [[host_name("attention_block_64")]] kernel void attention_block<64>(
     const device bfloat *, const device half *, const device half *, const device float *,
     device bfloat *, constant AttentionParams &, uint3, uint, uint, uint);
-template [[host_name("attention_block_128")]] kernel void attention_block<128>(
-    const device bfloat *, const device half *, const device half *, const device float *,
-    device bfloat *, constant AttentionParams &, uint3, uint, uint, uint);

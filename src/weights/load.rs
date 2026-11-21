@@ -275,9 +275,29 @@ impl Import {
 }
 
 pub(crate) fn load(file: &Gguf, audio: Option<&Gguf>) -> Result<Weights> {
+    // Building the tokenizer beside the GPU import, which it does not depend on.
+    std::thread::scope(|scope| {
+        let tokenizer = scope.spawn(|| Tokenizer::load(file));
+        let inner = architecture(file, audio)?;
+        let tokenizer = tokenizer
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+        ensure!(
+            tokenizer.vocabulary() == inner.base().embedding.vocabulary,
+            "tokenizer vocabulary does not match model weights"
+        );
+        Ok(Weights {
+            inner,
+            tokenizer: Arc::new(tokenizer),
+        })
+    })
+}
+
+/// Validate and import the weights of the checkpoint's architecture.
+fn architecture(file: &Gguf, audio: Option<&Gguf>) -> Result<super::Architecture> {
     let prefix = file.text("general.architecture")?;
     let p = Parameters { file, prefix };
-    let inner = match prefix {
+    Ok(match prefix {
         "qwen35" => {
             let g = p.geometry()?;
             qwen::load(file, &p, g, qwen::Dialect::Qwen35, audio)?
@@ -293,11 +313,6 @@ pub(crate) fn load(file: &Gguf, audio: Option<&Gguf>) -> Result<Weights> {
         }
         "nemotron_h_moe" => nemotron::load(file, &p)?,
         _ => bail!("unsupported architecture {prefix}"),
-    };
-    let tokenizer = Tokenizer::load(file, inner.base().embedding.vocabulary)?;
-    Ok(Weights {
-        inner,
-        tokenizer: Arc::new(tokenizer),
     })
 }
 

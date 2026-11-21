@@ -4,31 +4,25 @@ use crate::{
     gpu::{Gpu, Pipeline},
     tensor::WeightFormat,
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTL4Compiler, MTL4CompilerDescriptor, MTLDevice};
 use std::collections::HashMap;
 
+/// Compiled kernels, embedded at build time.
+const LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oco.metallib"));
+
 pub struct AttentionPipelines {
     pub rope: Pipeline,
-    pub dispatch: AttentionDispatch,
+    /// One threadgroup per head and query row, with several keys in flight per SIMD group.
+    pub vector: Pipeline,
+    /// Eight- and sixteen-query tiles GPT-OSS's 64-wide heads keep for prompts: its
+    /// references agree one token better with them than with the vector kernel.
     pub tiled: Option<Pipeline>,
+    /// The sixteen-query tiles, for its full 512-row chunks.
     pub wide: Option<Pipeline>,
-    /// 32-query register-softmax tiles for long batches of 64- or 128-wide heads.
+    /// 32-query register-softmax tiles for bidirectional batches of 64-wide heads.
     pub block: Option<Pipeline>,
-    pub split: Option<SplitAttentionPipelines>,
-}
-
-pub struct SplitAttentionPipelines {
-    pub partial: Pipeline,
-    pub merge: Pipeline,
-}
-
-pub enum AttentionDispatch {
-    /// Several keys in flight per SIMD group, for 64-, 128-, and 256-wide heads.
-    Vector(Pipeline),
-    /// One SIMD group per key step, for other head widths.
-    Plain(Pipeline),
 }
 
 pub struct GatedAttentionPipelines {
@@ -106,7 +100,7 @@ pub struct Builder {
 
 impl Builder {
     pub fn new(gpu: &Gpu) -> Result<Self> {
-        let library = gpu.new_library(include_bytes!(concat!(env!("OUT_DIR"), "/oco.metallib")))?;
+        let library = gpu.new_library(LIBRARY)?;
         let compiler = gpu
             .device
             .newCompilerWithDescriptor_error(&MTL4CompilerDescriptor::new())?;
@@ -301,6 +295,10 @@ impl Builder {
                 input_scales,
                 narrow,
                 wide,
+                sum: match kind {
+                    Q8_0 => None,
+                    _ => Some(self.get("matmul_split_sum", F32, 0)?),
+                },
             }
         };
         Ok(DenseMatrix {
@@ -329,46 +327,34 @@ impl Builder {
     ) -> Result<AttentionPipelines> {
         use WeightFormat::F32;
         let rope = self.get("rope", F32, 0)?;
-        let dispatch = match dim {
-            64 => AttentionDispatch::Vector(self.get("attention_vector_64", F32, 0)?),
-            128 => AttentionDispatch::Vector(self.get("attention_vector_128", F32, 0)?),
-            256 => AttentionDispatch::Vector(self.get("attention_vector_256", F32, 0)?),
-            _ => AttentionDispatch::Plain(self.get("attention", F32, 0)?),
+        let vector = match dim {
+            64 => "attention_vector_64",
+            128 => "attention_vector_128",
+            256 => "attention_vector_256",
+            _ => bail!("unsupported attention head width {dim}"),
         };
-        let tiled = if context >= 8 && dim <= 256 && dim.is_multiple_of(32) {
+        let vector = self.get(vector, F32, 0)?;
+        let tiled = if context >= 8 && dim == 64 {
             Some(self.get("attention_tiled", F32, 0)?)
         } else {
             None
         };
-        let wide = if context >= 512 && matches!(dim, 64 | 256) {
+        let wide = if context >= 512 && dim == 64 {
             Some(self.get("attention_wide16", F32, 0)?)
         } else {
             None
         };
-        let block = match dim {
-            64 if bidirectional && context >= 8 => Some(self.get("attention_block_64", F32, 0)?),
-            128 if bidirectional && context >= 8 => {
-                Some(self.get("attention_block_128", F32, 0)?)
-            }
-            _ => None,
-        };
-        let split = if context >= super::compute::AttentionPlan::SPLIT_MIN_KEYS
-            && matches!(dim, 64 | 96 | 128 | 256)
-        {
-            Some(SplitAttentionPipelines {
-                partial: self.get("attention_gqa_split", F32, 0)?,
-                merge: self.get("attention_gqa_merge", F32, 0)?,
-            })
+        let block = if bidirectional && context >= 8 && dim == 64 {
+            Some(self.get("attention_block_64", F32, 0)?)
         } else {
             None
         };
         Ok(AttentionPipelines {
             rope,
-            dispatch,
+            vector,
             tiled,
             wide,
             block,
-            split,
         })
     }
 

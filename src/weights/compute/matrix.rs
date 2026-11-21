@@ -2,7 +2,7 @@ use super::Bindings;
 use crate::gpu::{BufferRef, Commands};
 use crate::{
     gpu::{BufferView, ReadOnly, dispatch, dispatch_concurrent},
-    weights::operands::*,
+    weights::{operands::*, state::CommonScratch},
 };
 use bytemuck::{Pod, Zeroable, bytes_of};
 use std::ops::Range;
@@ -125,10 +125,11 @@ impl DenseMatrix {
         x: (&BufferRef, usize),
         y: &BufferView,
         m: usize,
-        dummy: &BufferView,
+        scratch: &CommonScratch,
         scales: (&BufferRef, usize),
         concurrent: bool,
     ) {
+        let dummy = &scratch.next;
         let first = if concurrent {
             dispatch_concurrent
         } else {
@@ -147,7 +148,7 @@ impl DenseMatrix {
         let scaled = self.uses_input_scales(m);
         let scales = if scaled { scales } else { dummy.binding() };
         let buffers = [self.values.binding(), x, y.binding(), bias, scales];
-        let (narrow, wide) = match &self.plan {
+        let (narrow, wide, sum) = match &self.plan {
             DensePlan::Vector(v) => {
                 first(
                     e,
@@ -164,6 +165,7 @@ impl DenseMatrix {
                 vector_rows,
                 narrow,
                 wide,
+                sum,
                 ..
             } => {
                 if m <= *vector_rows {
@@ -178,7 +180,7 @@ impl DenseMatrix {
                     );
                     return;
                 }
-                (narrow, wide)
+                (narrow, wide, sum)
             }
         };
         // Complete wide tiles share decoded weights across 64 rows. One independent tail
@@ -219,13 +221,65 @@ impl DenseMatrix {
                 scales,
             ];
             let groups = [tail.div_ceil(tile.rows), tile.column_groups, 1];
-            if full > 0 {
+            let splits = match sum {
+                Some(_) if full == 0 => self.splits(m, scratch),
+                _ => 1,
+            };
+            if let Some(sum) = sum.as_ref().filter(|_| splits > 1) {
+                // Ordering both passes: the partials are shared by every product of the batch.
+                let buffers = [
+                    buffers[0],
+                    buffers[1],
+                    scratch.partials.binding(),
+                    bias,
+                    scales,
+                ];
+                let groups = [groups[0], groups[1], splits];
+                dispatch(e, &tile.pipeline, &buffers, bytes_of(&p), groups, 128);
+                let finish = SplitSum {
+                    m: m as u32,
+                    n: self.output as u32,
+                    splits: splits as u32,
+                    has_bias: p.has_bias,
+                    scaled: scaled as u32,
+                };
+                let buffers = [scratch.partials.binding(), y.binding(), bias, scales];
+                let groups = [(m * self.output).div_ceil(256), 1, 1];
+                dispatch(e, sum, &buffers, bytes_of(&finish), groups, 256);
+            } else if full > 0 {
                 dispatch_concurrent(e, &tile.pipeline, &buffers, bytes_of(&p), groups, 128);
             } else {
                 first(e, &tile.pipeline, &buffers, bytes_of(&p), groups, 128);
             }
         }
     }
+
+    /// Split K across threadgroups when a short batch launches too few narrow tiles to keep
+    /// loads in flight: up to eight ways while the tile count stays near a thousand, every
+    /// split covers whole 32-column steps, and the partial sums fit their scratch.
+    fn splits(&self, rows: usize, scratch: &CommonScratch) -> usize {
+        let tiles = self.output.div_ceil(64) * rows.div_ceil(32);
+        let mut splits = 8;
+        while splits > 1
+            && (tiles * splits > 1100
+                || !(self.input / 32).is_multiple_of(splits)
+                || splits * rows * self.output * 4 > scratch.partials.length())
+        {
+            splits /= 2;
+        }
+        splits
+    }
+}
+
+/// Geometry for matmul_split_sum, which finishes K-split narrow tiles.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SplitSum {
+    m: u32,
+    n: u32,
+    splits: u32,
+    has_bias: u32,
+    scaled: u32,
 }
 
 impl Projection {
@@ -257,7 +311,7 @@ impl Projection {
             x,
             y,
             m,
-            &s.next,
+            s,
             s.projection_scales.binding(),
             false,
         );
@@ -272,7 +326,7 @@ impl Projection {
             s.norm.binding(),
             y,
             m,
-            &s.next,
+            s,
             s.norm_scales.binding(),
             false,
         );
@@ -287,7 +341,7 @@ impl Projection {
             s.norm.binding(),
             y,
             m,
-            &s.next,
+            s,
             s.norm_scales.binding(),
             true,
         );

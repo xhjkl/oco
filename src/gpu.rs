@@ -13,7 +13,11 @@ use dispatch2::DispatchData;
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::*;
-use std::{collections::HashMap, ptr::NonNull};
+use std::{
+    collections::HashMap,
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 // Loading CoreGraphics registers the default Metal device in command-line processes.
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -29,6 +33,8 @@ pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 /// Device used to register mapped weights, prepare immutable kernels, and allocate session buffers.
 pub struct Gpu {
     pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
+    /// Bytes of mapped or uploaded weights, which share the working set with session arenas.
+    weights: AtomicUsize,
 }
 
 impl Gpu {
@@ -37,7 +43,26 @@ impl Gpu {
         let device = device.ok_or_else(|| anyhow!("a Metal GPU is required"))?;
         let supported = device.supportsFamily(MTLGPUFamily::Metal4);
         ensure!(supported, "a Metal 4 GPU is required");
-        Ok(Self { device })
+        Ok(Self {
+            device,
+            weights: AtomicUsize::new(0),
+        })
+    }
+
+    /// Bytes the device keeps resident without paging, shared by weights and sessions.
+    pub fn working_set(&self) -> usize {
+        self.device.recommendedMaxWorkingSetSize() as usize
+    }
+
+    /// Bytes of weights this device holds for the model, counted against session budgets.
+    pub fn weight_bytes(&self) -> usize {
+        self.weights.load(Ordering::Relaxed)
+    }
+
+    /// Allocate shared storage for weights the caller fills once, counting it as weights.
+    pub fn weight_buffer(&self, bytes: usize) -> Buffer {
+        self.weights.fetch_add(bytes, Ordering::Relaxed);
+        self.new_buffer(bytes)
     }
 
     /// Load precompiled Metal IR supplied by the caller.

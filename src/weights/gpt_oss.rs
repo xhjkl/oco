@@ -57,7 +57,7 @@ impl Memory {
             4,
             c.embedding.vocabulary,
         )?;
-        let attention = AttentionScratch::plan(&mut p, batch, capacity, &g.attention)?;
+        let attention = AttentionScratch::plan(&mut p, batch, &g.attention)?;
         let states = kv_states(&mut p, g.layers.len(), capacity, &g.attention)?;
         let routes = batch * ACTIVE_EXPERTS;
         let routing = Routing {

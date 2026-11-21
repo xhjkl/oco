@@ -215,7 +215,7 @@ impl Bindings<'_> {
             self.scratch.norm.binding(),
             &s.dt,
             rows,
-            &self.scratch.next,
+            self.scratch,
             self.scratch.norm_scales.binding(),
             true,
         );

@@ -353,3 +353,106 @@ fn check_scaled_input(
     }
     Ok(())
 }
+
+/// Short batches split K across threadgroups and finish the sums in a second pass; the result
+/// must match the unsplit narrow tile up to the reordered FP32 additions, inside its guards.
+#[test]
+fn split_short_products_match_unsplit_tiles() -> Result<()> {
+    let gpu = Gpu::new()?;
+    let compute = Compute::new(&gpu, None);
+    let mut builder = Builder::new(&gpu)?;
+    let prepare = builder.get("q4_input_scales", WeightFormat::F32, 0)?;
+    let sum = builder.get("matmul_split_sum", WeightFormat::F32, 0)?;
+    const GUARD: usize = 32;
+    const MARKER: u16 = 0x7fc1;
+    for (format, symbol, scaled) in [
+        (WeightFormat::Q4_0, "matmul_q4_half", true),
+        (WeightFormat::Q5K, "matmul", false),
+    ] {
+        let (m, n, k, splits) = (13usize, 65usize, 1024usize, 4usize);
+        let pipeline = builder.get(symbol, format, 2)?;
+        let (weights, _) = dense_weights(format, n, k);
+        let rows: Vec<_> = (0..m * k)
+            .map(|i| bf16::from_f32((noise(i + 99) % 251) as f32 / 127.0 - 1.0).to_bits())
+            .collect();
+        let bias: Vec<_> = (0..n).map(|i| i as f32 * 0.01 - 0.3).collect();
+        let (w, x, b) = (
+            buffer(&gpu, &weights),
+            buffer(&gpu, &rows),
+            buffer(&gpu, &bias),
+        );
+        let scales = buffer(&gpu, &vec![0f32; 2 * m]);
+        let guarded = vec![MARKER; GUARD + m * n + GUARD];
+        let (direct, split) = (buffer(&gpu, &guarded), buffer(&gpu, &guarded));
+        let partials = buffer(&gpu, &vec![f32::NAN; splits * m * n]);
+        let params = [k as u32, n as u32, m as u32, 0, 4, 1, 1];
+        let finish = [m as u32, n as u32, splits as u32, 1, scaled as u32];
+        let groups = [1, n.div_ceil(64), 1];
+        let submission = compute.submit(|e| {
+            dispatch(
+                e,
+                &prepare,
+                &[(&x, 0), (&scales, 0)],
+                bytemuck::cast_slice(&params),
+                [m, 1, 1],
+                256,
+            );
+            let product = |y| [(&*w, 0), (&*x, 0), y, (&*b, 0), (&*scales, 0)];
+            let params = bytemuck::cast_slice(&params);
+            dispatch(
+                e,
+                &pipeline,
+                &product((&*direct, GUARD * 2)),
+                params,
+                groups,
+                128,
+            );
+            let groups = [groups[0], groups[1], splits];
+            dispatch(e, &pipeline, &product((&*partials, 0)), params, groups, 128);
+            let buffers = [
+                (&*partials, 0),
+                (&*split, GUARD * 2),
+                (&*b, 0),
+                (&*scales, 0),
+            ];
+            let groups = [(m * n).div_ceil(256), 1, 1];
+            dispatch(
+                e,
+                &sum,
+                &buffers,
+                bytemuck::cast_slice(&finish),
+                groups,
+                256,
+            );
+        });
+        futures_lite::future::block_on(submission)?;
+        let (mut expected, mut actual) = (guarded.clone(), guarded.clone());
+        read(&direct, &mut expected);
+        read(&split, &mut actual);
+        for output in [&expected, &actual] {
+            assert!(
+                output[..GUARD]
+                    .iter()
+                    .chain(&output[GUARD + m * n..])
+                    .all(|&v| v == MARKER)
+            );
+        }
+        for (i, (&want, &got)) in expected[GUARD..GUARD + m * n]
+            .iter()
+            .zip(&actual[GUARD..])
+            .enumerate()
+        {
+            let (want, got) = (
+                bf16::from_bits(want).to_f32(),
+                bf16::from_bits(got).to_f32(),
+            );
+            // Two BF16 steps cover a rounding boundary crossed by the reordered sums.
+            let step = want.abs().max(got.abs()) * 2.0f32.powi(-7);
+            assert!(
+                (want - got).abs() <= step,
+                "{format:?} element {i}: {got} vs {want}"
+            );
+        }
+    }
+    Ok(())
+}

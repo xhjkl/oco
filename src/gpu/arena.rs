@@ -49,7 +49,7 @@ impl Plan {
 
     pub fn allocate(mut self, gpu: &Gpu) -> Result<Arena> {
         let limit = gpu.device.maxBufferLength();
-        let budget = usize::try_from(gpu.device.recommendedMaxWorkingSetSize())?;
+        let budget = gpu.working_set();
         self.regions
             .sort_unstable_by_key(|r| (std::cmp::Reverse(r.bytes), r.index));
         let mut lengths: Vec<usize> = Vec::new();
@@ -90,9 +90,11 @@ impl Plan {
             .iter()
             .try_fold(0usize, |a, &b| a.checked_add(b))
             .context("aggregate arena size overflow")?;
+        // Weights stay resident beside every session, so only the remainder is available;
+        // other live sessions are not counted.
         ensure!(
-            total <= budget,
-            "session arenas exceed the per-session working-set budget"
+            total <= budget.saturating_sub(gpu.weight_bytes()),
+            "this session's buffers exceed the working set left beside the model's weights"
         );
         self.regions.sort_unstable_by_key(|r| r.index);
         let mut buffers = Vec::with_capacity(lengths.len());

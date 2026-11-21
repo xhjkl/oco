@@ -80,14 +80,12 @@ impl Memory {
             product(batch, q.attention.output_width.max(q.delta.conv_width()))?,
             2,
         )?;
-        let partials = AttentionScratch::plan_partials(&mut p, capacity, &q.attention)?;
         let attention = AttentionScratch {
             q: query,
             k: p.slot(product(batch, q.attention.key_width)?, 2)?,
             v: value,
             mixed,
             rotated,
-            partials,
         };
         let delta = DeltaScratch {
             qkv: query,

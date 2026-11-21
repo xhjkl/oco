@@ -207,7 +207,7 @@ impl<'a> Store<'a> {
                 .checked_add(records[name].bytes.next_multiple_of(256))
                 .context("checkpoint size overflow")?;
         }
-        let buffer = gpu.new_buffer(total);
+        let buffer = gpu.weight_buffer(total);
         let storage = BufferView::new(&buffer, 0, total);
         for (name, record) in &records {
             let source = &file[record.offset..record.offset + record.bytes];

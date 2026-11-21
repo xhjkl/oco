@@ -155,13 +155,13 @@ impl Transcriber {
         let unfolded = p.slot(unfolded, 2)?;
         let stage = p.slot(product(frames, m.state)?, 2)?;
         let encoder = CommonScratch::plan(&mut p, rows, m.state, 4 * m.state, 1, 2, 1)?;
-        let encoder_attention = AttentionScratch::plan(&mut p, rows, rows, &m.encoder.attention)?;
+        let encoder_attention = AttentionScratch::plan(&mut p, rows, &m.encoder.attention)?;
         let encoder_kv = kv_states(&mut p, 1, rows, &m.encoder.attention)?;
         let cross = kv_states(&mut p, m.decoder.layers.len(), rows, &m.decoder.cross)?;
         let text = m.text_context;
         let vocabulary = m.vocabulary.size;
         let decoder = CommonScratch::plan(&mut p, text, m.state, 4 * m.state, 1, 2, vocabulary)?;
-        let decoder_attention = AttentionScratch::plan(&mut p, text, text, &m.decoder.attention)?;
+        let decoder_attention = AttentionScratch::plan(&mut p, text, &m.decoder.attention)?;
         let decoder_kv = kv_states(&mut p, m.decoder.layers.len(), text, &m.decoder.attention)?;
         let a = p.allocate(&m.gpu)?;
         Ok(Self {

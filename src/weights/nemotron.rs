@@ -89,7 +89,7 @@ impl Memory {
             2,
             c.embedding.vocabulary,
         )?;
-        let attention = AttentionScratch::plan(&mut p, batch, capacity, &n.attention)?;
+        let attention = AttentionScratch::plan(&mut p, batch, &n.attention)?;
         let mamba = MambaScratch::plan(&mut p, batch, &n.mamba)?;
         let routes = batch * active;
         let routing = Routing {

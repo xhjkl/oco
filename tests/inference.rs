@@ -1,3 +1,5 @@
+//! Streaming, continuation, and reset for each checkpoint. Set QWEN_PATH, GPT_OSS_PATH, and
+//! NEMOTRON_PATH to GGUF files; tests without a path are skipped.
 use anyhow::{Context, Result};
 use futures_lite::StreamExt;
 use std::{sync::Mutex, time::Instant};
@@ -21,8 +23,10 @@ fn nemotron_infers() -> Result<()> {
 }
 
 fn infer(variable: &str, input: &[u32]) -> Result<()> {
-    let path =
-        std::env::var_os(variable).with_context(|| format!("set {variable} to a GGUF file"))?;
+    let Some(path) = std::env::var_os(variable) else {
+        eprintln!("{variable} unset; skipping");
+        return Ok(());
+    };
     let _gpu = GPU.lock().unwrap_or_else(|error| error.into_inner());
     let started = Instant::now();
     let weights = oco::load(path)?;

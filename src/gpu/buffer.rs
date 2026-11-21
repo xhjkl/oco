@@ -6,8 +6,10 @@ use bytemuck::Pod;
 use memmap2::Mmap;
 use objc2::{Message, rc::Retained};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+use std::io::{self, Read, Write};
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// Bounded byte range within a session allocation, used by both the host and Metal kernels.
 ///
@@ -78,6 +80,22 @@ impl BufferView {
         unsafe {
             std::ptr::write_bytes(self.pointer(), 0, self.length);
         }
+    }
+
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
+    /// Write the first `length` bytes to `sink` without staging them in host memory.
+    pub fn store(&self, length: usize, sink: &mut impl Write) -> io::Result<()> {
+        assert!(length <= self.length, "store exceeds storage range");
+        sink.write_all(unsafe { std::slice::from_raw_parts(self.pointer(), length) })
+    }
+
+    /// Fill the first `length` bytes from `source` without staging them in host memory.
+    pub fn load(&self, length: usize, source: &mut impl Read) -> io::Result<()> {
+        assert!(length <= self.length, "load exceeds storage range");
+        source.read_exact(unsafe { std::slice::from_raw_parts_mut(self.pointer(), length) })
     }
 
     fn pointer(&self) -> *mut u8 {
@@ -202,7 +220,7 @@ impl Gpu {
     /// Copy host bytes into a new shared allocation and expose it as immutable weights.
     /// Used for operands repacked at load time, such as padded convolution kernels.
     pub fn upload(&self, bytes: &[u8]) -> ReadOnly {
-        let buffer = self.new_buffer(bytes.len());
+        let buffer = self.weight_buffer(bytes.len());
         BufferView::new(&buffer, 0, bytes.len()).write(0, bytes);
         ReadOnly {
             buffer,
@@ -268,6 +286,7 @@ impl Gpu {
         .ok_or_else(|| anyhow::anyhow!("Metal mapping registration failed"))?;
         // Sharing immutable mapped bytes; the deallocator owns their mapping.
         let buffer = unsafe { Retained::cast_unchecked(buffer) };
+        self.weights.fetch_add(length, Ordering::Relaxed);
         Ok(ReadOnly {
             buffer,
             offset,

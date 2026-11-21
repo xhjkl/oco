@@ -1,16 +1,12 @@
 # ⚫️ oco
 
-Oco is an inference engine written in Rust and Metal for Apple Silicon. It generates
-text greedily and transcribes speech with these model architectures:
+Oco runs Qwen, gpt-oss, and Whisper on Apple Silicon, in Rust and Metal, and very little else.
+Serving so few architectures is the point: every kernel is written for the model it runs.
 
-| Models | Checkpoints |
-| --- | --- |
-| GPT-OSS | GGUF `gpt-oss`, with MXFP4 experts |
-| Qwen3 dense | GGUF `qwen3` and the `qwen3vl` text stack |
-| Qwen3.5/3.8 dense | GGUF `qwen35`, with gated attention and gated delta layers |
-| Nemotron-H MoE (Nemotron 3.5 Lightning) | GGUF `nemotron_h_moe`, with Mamba-2, attention, and routed experts |
-| Whisper, tiny through large-v3 and large-v3-turbo | whisper.cpp `ggml-*.bin` |
-| Qwen3-ASR | Text GGUF paired with its `mmproj` audio encoder GGUF |
+From the same GGUF, it generates gpt-oss-20b tokens 22% faster than llama.cpp and Qwen3.8-27B
+tokens 5% faster; it transcribes long recordings 11% faster than whisper.cpp at the same
+accuracy. An agent's next turn costs only its new tokens: a session rewinds to where the
+conversation diverged, and a saved prompt reopens in milliseconds instead of being read again.
 
 ```rust,no_run
 # async fn example() -> anyhow::Result<()> {
@@ -30,22 +26,8 @@ println!("{}", decoder.finish());
 # }
 ```
 
-Sessions retain context between input suffixes; `reset()` starts a fresh sequence.
-The tokenizer and special tokens come from the checkpoint.
+`infer` appends to what a session already holds. `rewind` returns to an earlier position,
+`checkpoint` keeps that cheap for recurrent layers, and `save` with `open_session` carries a
+prefilled prompt across processes. The tokenizer and special tokens come from the checkpoint.
 
-## Examples
-
-Run an example with `cargo run --release --example NAME -- ARGS`:
-
-| Example | Arguments | Purpose |
-| --- | --- | --- |
-| [infer](examples/infer.rs) | `MODEL.gguf [QUESTION]` | Stream an answer to a question |
-| [producer](examples/producer.rs) | `MODEL.gguf [QUESTION]` | Consume a token stream with backpressure |
-| [bench](examples/bench.rs) | `MODEL.gguf [PROMPT_TOKENS] [GENERATED] [REPEATS]` | Measure prefill and decode throughput |
-| [agree](examples/agree.rs) | `MODEL.gguf PROMPT_LEN IDS...` | Measure agreement with a reference token sequence |
-| [tokens](examples/tokens.rs) | `MODEL.gguf TEXT` | Print token IDs |
-| [transcribe](examples/transcribe.rs) | `ggml-MODEL.bin speech.wav [LANGUAGE]` | Transcribe with Whisper |
-| [transcribe](examples/transcribe.rs) | `Qwen3-ASR.gguf mmproj.gguf speech.wav` | Transcribe with Qwen3-ASR |
-
-The text examples provide conversation framing in [examples/common](examples/common/mod.rs).
-Speech examples take 16 kHz WAV audio.
+Runnable programs live in [examples](examples): `cargo run --release --example NAME -- ARGS`.

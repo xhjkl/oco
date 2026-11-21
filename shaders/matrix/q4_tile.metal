@@ -146,21 +146,26 @@ inline void matmul_tile_wide(const device uchar *w, const device bfloat *x, devi
 // Narrow tiles: 8·R tokens × 64 rows per threadgroup for prompts shorter than a wide tile
 // and for the tail rows of longer prompts. Each SIMD group owns 16 rows across all token tiles,
 // so the per-threadgroup weight decoding is amortized over exactly the tokens present.
+// A grid of more than one layer splits K across them: short batches launch too few tiles to
+// keep the GPU's loads in flight. Each split then stores its raw FP32 sums through `y` into
+// layer-major partials, and matmul_split_sum finishes the rows.
 template <bool Q4, bool Scaled, short R>
 inline void matmul_tile_rows(const device uchar *w, const device bfloat *x, device bfloat *y,
                              const device float *bias, constant Matrix &p,
                              threadgroup half *wt, threadgroup half *xs,
-                             const device float2 *scales, uint3 group, ushort tid, ushort lane, ushort sg) {
+                             const device float2 *scales, uint3 group, uint3 grid,
+                             ushort tid, ushort lane, ushort sg) {
     constexpr ushort BK = 32, STRIDE = BK + 8, BM = 8 * R;
     uint n0 = group.y * 64, m0 = group.x * BM;
+    uint span = p.k / grid.z, begin = group.z * span;
     ushort wn = tid / 2, wk = (tid % 2) * 16;
     uint block_bytes = weight_type == WeightFormat::Q4_0 ? 18 : 20;
     const device uchar *weights = w + min(n0 + wn, p.n - 1) * packed_row_bytes(p.k);
-    const device uchar *block = weights;
+    const device uchar *block = weights + begin / 32 * block_bytes;
     // Each of the first 4·BM threads stages eight activations of one token row.
     bool stager = tid < 4 * BM;
     ushort xm = tid / 4, xk = (tid % 4) * 8;
-    const device bfloat *row = x + min(m0 + xm, p.m - 1) * p.k + xk;
+    const device bfloat *row = x + min(m0 + xm, p.m - 1) * p.k + begin + xk;
     float gain = Scaled && stager ? scales[min(m0 + xm, p.m - 1)].x : 1.0f;
     simdgroup_half8x8 a[2], b[R];
     simdgroup_float8x8 accum[R][2];
@@ -169,7 +174,7 @@ inline void matmul_tile_rows(const device uchar *w, const device bfloat *x, devi
 #pragma unroll
         for (short c = 0; c < 2; ++c)
             accum[r][c] = simdgroup_float8x8(0);
-    for (uint base = 0; base < p.k; base += BK) {
+    for (uint base = begin; base < begin + span; base += BK) {
         half4x4 decoded;
         if (Q4) {
             decoded = q4_block(block, wk / 16);
@@ -229,8 +234,13 @@ inline void matmul_tile_rows(const device uchar *w, const device bfloat *x, devi
             uint n = col0 + c * 8;
 #pragma unroll
             for (short j = 0; j < 2; ++j) {
-                if (n + j < p.n)
-                    y[m * p.n + n + j] = bfloat(accum[r][c].thread_elements()[j] * inverse_gain +
+                if (n + j >= p.n)
+                    continue;
+                float sum = accum[r][c].thread_elements()[j];
+                if (grid.z > 1)
+                    reinterpret_cast<device float *>(y)[(group.z * p.m + m) * p.n + n + j] = sum;
+                else
+                    y[m * p.n + n + j] = bfloat(sum * inverse_gain +
                                                 (p.has_bias ? float(bfloat(bias[n + j])) : 0));
             }
         }

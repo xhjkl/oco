@@ -9,7 +9,6 @@
 #include "attention_wide.metal"
 #include "attention_block.metal"
 #include "attention_vector.metal"
-#include "attention_split.metal"
 #include "recurrent.metal"
 #include "nemotron.metal"
 #include "argmax.metal"

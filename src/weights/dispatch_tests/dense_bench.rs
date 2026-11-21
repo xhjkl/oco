@@ -1,215 +1,278 @@
-//! Bandwidth of the dense single-row kernels at Qwen3-ASR's Q8_0 shapes. Ignored by default:
-//! `cargo test --release --lib dense_matvec_bandwidth -- --ignored --nocapture`.
-use crate::gpu::{Gpu, dispatch, tests::buffer};
+//! Kernel timings at checkpoint shapes, for choosing dispatch thresholds. Ignored by default:
+//! `cargo test --release --lib dense_bench -- --ignored --nocapture --test-threads=1`.
+use crate::gpu::{Buffer, Gpu, Pipeline, dispatch, tests::buffer};
 use crate::tensor::WeightFormat;
 use crate::weights::compute::AttentionParams;
 use crate::weights::{compute::Compute, pipelines::Builder};
 use anyhow::Result;
 use std::time::Instant;
 
+/// Best per-dispatch time of `iterations` ordered launches in one submission.
+fn time(
+    compute: &Compute,
+    iterations: usize,
+    launch: impl Fn(&crate::gpu::Commands),
+) -> Result<f64> {
+    futures_lite::future::block_on(compute.submit(&launch))?;
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let started = Instant::now();
+        futures_lite::future::block_on(compute.submit(|e| {
+            for _ in 0..iterations {
+                launch(e);
+            }
+        }))?;
+        best = best.min(started.elapsed().as_secs_f64() / iterations as f64);
+    }
+    Ok(best)
+}
+
+/// Q4_0 weights with a small positive scale in every block header.
+fn q4_weights(gpu: &Gpu, n: usize, k: usize) -> Buffer {
+    let bytes: Vec<u8> = (0..n * k / 32 * 18)
+        .map(|i| match i % 18 {
+            0 => 0x00,
+            1 => 0x2c,
+            _ => ((i * 2654435761usize) >> 7) as u8,
+        })
+        .collect();
+    buffer(gpu, &bytes)
+}
+
+/// Qwen3.8 projection products for 1 to 128 rows on both paths: the per-row vector kernel and
+/// the tiled products with their gain scan, which `DensePlan` chooses between.
 #[test]
 #[ignore]
-fn dense_matvec_bandwidth() -> Result<()> {
+fn q4_batch_paths() -> Result<()> {
     let gpu = Gpu::new()?;
     let compute = Compute::new(&gpu, None);
     let mut builder = Builder::new(&gpu)?;
-    let iterations = 200;
-    {
-        let add = builder.get("add", WeightFormat::F32, 0)?;
-        let a = buffer(&gpu, &[0u16; 256]);
-        let n = 1u32;
-        let mut best = f64::MAX;
-        for _ in 0..3 {
-            let started = Instant::now();
-            futures_lite::future::block_on(compute.submit(|e| {
-                for _ in 0..iterations {
+    let format = WeightFormat::Q4_0;
+    let vector = builder.get("matvec_q4", format, 0)?;
+    let scales = builder.get("q4_input_scales", WeightFormat::F32, 0)?;
+    let sum = builder.get("matmul_split_sum", WeightFormat::F32, 0)?;
+    let tiles: Vec<Pipeline> = (0..5)
+        .map(|variant| builder.get("matmul_q4_half", format, variant))
+        .collect::<Result<_>>()?;
+    for (k, n) in [(5120usize, 17408usize), (17408, 5120), (5120, 10240)] {
+        let w = q4_weights(&gpu, n, k);
+        let x = buffer(&gpu, &vec![0x3f80u16; 512 * k]);
+        let y = buffer(&gpu, &vec![0u16; 512 * n]);
+        let gains = buffer(&gpu, &vec![1.0f32; 2 * 512]);
+        let partials = buffer(&gpu, &vec![0f32; 16 * 32 * n]);
+        let bytes = (n * k / 32 * 18) as f64;
+        eprintln!("{k} -> {n} ({:.1} MB)", bytes / 1e6);
+        for m in [1usize, 2, 4, 8, 16, 24, 32, 48, 64, 128, 256, 512] {
+            let p = [k as u32, n as u32, m as u32, 0, 4, 1, 0];
+            let params = bytemuck::cast_slice(&p);
+            let buffers = [(&*w, 0), (&*x, 0), (&*y, 0), (&*y, 0), (&*gains, 0)];
+            let threads = Builder::vector_threads(n);
+            let groups = n.div_ceil(threads / 8);
+            let iterations = 20;
+            let per_row = time(&compute, iterations, |e| {
+                dispatch(e, &vector, &buffers, params, [groups, m, 1], threads)
+            })?;
+            let tiled = time(&compute, iterations, |e| {
+                dispatch(
+                    e,
+                    &scales,
+                    &[(&*x, 0), (&*gains, 0)],
+                    params,
+                    [m, 1, 1],
+                    256,
+                );
+                let full = m / 64 * 64;
+                if full > 0 {
+                    let p = [k as u32, n as u32, full as u32, 0, 4, 1, 0];
+                    let groups = [full / 64, n.div_ceil(64), 1];
                     dispatch(
                         e,
-                        &add,
-                        &[(&a, 0), (&a, 0)],
-                        bytemuck::bytes_of(&n),
-                        [1, 1, 1],
-                        256,
+                        &tiles[0],
+                        &buffers,
+                        bytemuck::cast_slice(&p),
+                        groups,
+                        128,
                     );
                 }
-            }))?;
-            best = best.min(started.elapsed().as_secs_f64() / iterations as f64);
-        }
-        eprintln!("dispatch floor: {:.1} us", best * 1e6);
-    }
-    for (k, n) in [
-        (2048usize, 2048usize),
-        (2048, 1024),
-        (2048, 6144),
-        (6144, 2048),
-        (2048, 151936),
-    ] {
-        let bytes = n * k / 32 * 34;
-        let w: Vec<u8> = (0..bytes)
-            .map(|i| {
-                if i % 34 < 2 {
-                    if i % 34 == 0 { 0x00 } else { 0x2c }
-                } else {
-                    ((i * 2654435761usize) >> 7) as u8
+                let tail = m - full;
+                if tail > 0 {
+                    let variant = tail.min(32).div_ceil(8);
+                    let p = [k as u32, n as u32, tail as u32, 0, 4, 1, 0];
+                    let groups = [tail.div_ceil(variant * 8), n.div_ceil(64), 1];
+                    dispatch(
+                        e,
+                        &tiles[variant],
+                        &buffers,
+                        bytemuck::cast_slice(&p),
+                        groups,
+                        128,
+                    );
                 }
-            })
-            .collect();
-        let w = buffer(&gpu, &w);
-        let x: Vec<u16> = (0..k)
-            .map(|i| half::bf16::from_f32(((i * 7) % 97) as f32 / 48.0 - 1.0).to_bits())
-            .collect();
-        let x = buffer(&gpu, &x);
-        let y = buffer(&gpu, &vec![0u16; n * 2]);
-        let vector = builder.vector_with(WeightFormat::Q8_0, n, n > 100_000)?;
-        let p = [k as u32, n as u32, 1, 0, 4, 1, 0];
-        let run = |threads: usize, groups: usize| -> Result<f64> {
-            futures_lite::future::block_on(compute.submit(|e| {
-                dispatch(
-                    e,
-                    &vector.pipeline,
-                    &[(&w, 0), (&x, 0), (&y, 0), (&y, 0), (&y, 0)],
-                    bytemuck::cast_slice(&p),
-                    [groups, 1, 1],
-                    threads,
-                );
-            }))?;
-            let mut best = f64::MAX;
-            for _ in 0..3 {
-                let started = Instant::now();
-                futures_lite::future::block_on(compute.submit(|e| {
-                    for _ in 0..iterations {
-                        dispatch(
-                            e,
-                            &vector.pipeline,
-                            &[(&w, 0), (&x, 0), (&y, 0), (&y, 0), (&y, 0)],
-                            bytemuck::cast_slice(&p),
-                            [groups, 1, 1],
-                            threads,
-                        );
-                    }
-                }))?;
-                best = best.min(started.elapsed().as_secs_f64() / iterations as f64);
+            })?;
+            let mut sweep = String::new();
+            for splits in [2usize, 4, 8, 16] {
+                if m > 32 || !(k / 32).is_multiple_of(splits) {
+                    continue;
+                }
+                let seconds = time(&compute, iterations, |e| {
+                    dispatch(
+                        e,
+                        &scales,
+                        &[(&*x, 0), (&*gains, 0)],
+                        params,
+                        [m, 1, 1],
+                        256,
+                    );
+                    let variant = m.div_ceil(8);
+                    let product = [(&*w, 0), (&*x, 0), (&*partials, 0), (&*y, 0), (&*gains, 0)];
+                    let groups = [1, n.div_ceil(64), splits];
+                    dispatch(e, &tiles[variant], &product, params, groups, 128);
+                    let finish = [m as u32, n as u32, splits as u32, 0, 1];
+                    let buffers = [(&*partials, 0), (&*y, 0), (&*y, 0), (&*gains, 0)];
+                    let groups = [(m * n).div_ceil(256), 1, 1];
+                    dispatch(
+                        e,
+                        &sum,
+                        &buffers,
+                        bytemuck::cast_slice(&finish),
+                        groups,
+                        256,
+                    );
+                })?;
+                sweep.push_str(&format!("  split{splits} {:7.1} us", seconds * 1e6));
             }
-            Ok(best)
-        };
-        let mut line = format!("{k:>5} -> {n:>6} ({:6.1} MB):", bytes as f64 / 1e6);
-        for threads in [64usize, 256] {
-            let groups = n.div_ceil(threads / 8);
-            let seconds = run(threads, groups)?;
-            line.push_str(&format!(
-                "  {threads:>3} thr {:7.1} us {:6.1} GB/s",
-                seconds * 1e6,
-                bytes as f64 / seconds / 1e9
-            ));
+            eprintln!(
+                "  m {m:>3}: per-row {:8.1} us  tiled {:8.1} us  ({:5.1} us per row){sweep}",
+                per_row * 1e6,
+                tiled * 1e6,
+                tiled * 1e6 / m as f64,
+            );
         }
-        let split = builder.get("matvec_q8_split", WeightFormat::Q8_0, 0)?;
-        let run_split = || -> Result<f64> {
-            futures_lite::future::block_on(compute.submit(|e| {
-                dispatch(
-                    e,
-                    &split,
-                    &[(&w, 0), (&x, 0), (&y, 0), (&y, 0), (&y, 0)],
-                    bytemuck::cast_slice(&p),
-                    [n.div_ceil(2), 1, 1],
-                    128,
-                );
-            }))?;
-            let mut best = f64::MAX;
-            for _ in 0..3 {
-                let started = Instant::now();
-                futures_lite::future::block_on(compute.submit(|e| {
-                    for _ in 0..iterations {
-                        dispatch(
-                            e,
-                            &split,
-                            &[(&w, 0), (&x, 0), (&y, 0), (&y, 0), (&y, 0)],
-                            bytemuck::cast_slice(&p),
-                            [n.div_ceil(2), 1, 1],
-                            128,
-                        );
-                    }
-                }))?;
-                best = best.min(started.elapsed().as_secs_f64() / iterations as f64);
-            }
-            Ok(best)
-        };
-        let seconds = run_split()?;
-        line.push_str(&format!(
-            "  split {:7.1} us {:6.1} GB/s",
-            seconds * 1e6,
-            bytes as f64 / seconds / 1e9
-        ));
-        eprintln!("{line}");
     }
     Ok(())
 }
 
-/// Single-query attention kernels at Qwen3-ASR's head geometry over growing histories.
-/// `cargo test --release --lib decode_attention_latency -- --ignored --nocapture`.
+/// Single-query attention at Qwen3.8's (24 query heads over 4 KV heads of 256) and GPT-OSS's
+/// (64 over 8 of 64) geometry, from short to long agent contexts.
 #[test]
 #[ignore]
 fn decode_attention_latency() -> Result<()> {
     let gpu = Gpu::new()?;
     let compute = Compute::new(&gpu, None);
     let mut builder = Builder::new(&gpu)?;
-    let iterations = 200;
-    for (heads, kv_heads, dim, keys) in [
-        (16usize, 8usize, 128usize, 64usize),
-        (16, 8, 128, 256),
-        (16, 8, 128, 1024),
-        (16, 8, 128, 4096),
-        (32, 4, 256, 256),
-        (32, 4, 256, 1024),
-        (32, 4, 256, 4096),
-    ] {
+    for (heads, kv_heads, dim) in [(24usize, 4usize, 256usize), (64, 8, 64)] {
+        let symbol = if dim == 256 {
+            "attention_vector_256"
+        } else {
+            "attention_vector_64"
+        };
+        let vector = builder.get(symbol, WeightFormat::F32, 0)?;
         let q = buffer(
             &gpu,
             &vec![half::bf16::from_f32(0.01).to_bits(); heads * dim],
         );
-        let kv = buffer(
-            &gpu,
-            &vec![half::f16::from_f32(0.02).to_bits(); keys * kv_heads * dim],
-        );
         let out = buffer(&gpu, &vec![0u16; heads * dim]);
-        let p = AttentionParams {
-            heads: heads as u32,
-            kv_heads: kv_heads as u32,
-            dim: dim as u32,
-            pos: keys as u32 - 1,
-            window: 0,
-            sinks: 0,
-            scale: 1.0 / (dim as f32).sqrt(),
-            m: 1,
-            keys: 0,
-        };
-        let mut line = format!("D{dim} {keys:>5} keys:");
-        let vector: &str = if dim == 128 {
-            "attention_vector_128"
-        } else {
-            "attention_vector_256"
-        };
-        for (symbol, threads) in [("attention", 1024usize), (vector, 256)] {
-            let pipeline = builder.get(symbol, WeightFormat::F32, 0)?;
-            let mut best = f64::MAX;
-            for _ in 0..3 {
-                let started = Instant::now();
-                futures_lite::future::block_on(compute.submit(|e| {
-                    for _ in 0..iterations {
-                        dispatch(
-                            e,
-                            &pipeline,
-                            &[(&q, 0), (&kv, 0), (&kv, 0), (&out, 0), (&out, 0)],
-                            bytemuck::bytes_of(&p),
-                            [heads, 1, 1],
-                            threads,
-                        );
-                    }
-                }))?;
-                best = best.min(started.elapsed().as_secs_f64() / iterations as f64);
-            }
-            line.push_str(&format!("  {symbol:>14} {:6.1} us", best * 1e6));
+        for keys in [1024usize, 2048, 4096, 8192, 16384, 32768] {
+            let kv = buffer(
+                &gpu,
+                &vec![half::f16::from_f32(0.02).to_bits(); keys * kv_heads * dim],
+            );
+            let p = AttentionParams {
+                heads: heads as u32,
+                kv_heads: kv_heads as u32,
+                dim: dim as u32,
+                pos: keys as u32 - 1,
+                window: 0,
+                sinks: 0,
+                scale: 1.0 / (dim as f32).sqrt(),
+                m: 1,
+                keys: 0,
+            };
+            let buffers = [(&*q, 0), (&*kv, 0), (&*kv, 0), (&*out, 0), (&*out, 0)];
+            let seconds = time(&compute, 100, |e| {
+                dispatch(
+                    e,
+                    &vector,
+                    &buffers,
+                    bytemuck::bytes_of(&p),
+                    [heads, 1, 1],
+                    256,
+                )
+            })?;
+            let bytes = (2 * keys * kv_heads * dim * 2) as f64;
+            eprintln!(
+                "{heads}/{kv_heads}x{dim} {keys:>5} keys: {:7.1} us ({:5.1} GB/s of KV)",
+                seconds * 1e6,
+                bytes / seconds / 1e9
+            );
         }
-        eprintln!("{line}");
+    }
+    Ok(())
+}
+
+/// Causal prompt attention at both checkpoints' head geometries (and GPT-OSS's 128-token
+/// window) over agent-length histories: one vector threadgroup per head and row against the
+/// sixteen-query tiles `AttentionPlan` keeps for windowed full chunks.
+#[test]
+#[ignore]
+fn prefill_attention() -> Result<()> {
+    let gpu = Gpu::new()?;
+    let compute = Compute::new(&gpu, None);
+    let mut builder = Builder::new(&gpu)?;
+    let wide = builder.get("attention_wide16", WeightFormat::F32, 0)?;
+    for (heads, kv_heads, dim, window) in [
+        (24usize, 4usize, 256usize, 0usize),
+        (64, 8, 64, 0),
+        (64, 8, 64, 128),
+    ] {
+        let symbol = if dim == 256 {
+            "attention_vector_256"
+        } else {
+            "attention_vector_64"
+        };
+        let vector = builder.get(symbol, WeightFormat::F32, 0)?;
+        eprintln!("{heads}/{kv_heads}x{dim}, window {window}");
+        for history in [0usize, 512, 2048, 4096, 8192] {
+            let kv = buffer(
+                &gpu,
+                &vec![half::f16::from_f32(0.02).to_bits(); (history + 512) * kv_heads * dim],
+            );
+            let q = buffer(
+                &gpu,
+                &vec![half::bf16::from_f32(0.01).to_bits(); 512 * heads * dim],
+            );
+            let out = buffer(&gpu, &vec![0u16; 512 * heads * dim]);
+            for m in [8usize, 32, 128, 512] {
+                let p = AttentionParams {
+                    heads: heads as u32,
+                    kv_heads: kv_heads as u32,
+                    dim: dim as u32,
+                    pos: history as u32,
+                    window: window as u32,
+                    sinks: 0,
+                    scale: 1.0 / (dim as f32).sqrt(),
+                    m: m as u32,
+                    keys: 0,
+                };
+                let buffers = [(&*q, 0), (&*kv, 0), (&*kv, 0), (&*out, 0), (&*out, 0)];
+                let params = bytemuck::bytes_of(&p);
+                let rows = time(&compute, 10, |e| {
+                    dispatch(e, &vector, &buffers, params, [heads, m, 1], 256)
+                })?;
+                let sixteen = if m == 512 {
+                    time(&compute, 10, |e| {
+                        dispatch(e, &wide, &buffers, params, [heads, m / 16, 1], 128)
+                    })?
+                } else {
+                    f64::NAN
+                };
+                eprintln!(
+                    "  history {history:>5}, {m:>3} rows: vector {:8.1} us  wide16 {:8.1} us",
+                    rows * 1e6,
+                    sixteen * 1e6
+                );
+            }
+        }
     }
     Ok(())
 }

@@ -389,8 +389,6 @@ fn gpu_bidirectional_attention_matches_reference() -> Result<()> {
     };
     for (symbol, groups, threads) in [
         ("attention_block_64", [heads, rows.div_ceil(32), 1], 128),
-        ("attention_tiled", [heads, rows.div_ceil(8), 1], 128),
-        ("attention", [heads, rows, 1], 1024),
         ("attention_vector_64", [heads, rows, 1], 256),
     ] {
         let pipeline = builder.get(symbol, WeightFormat::F32, 0)?;

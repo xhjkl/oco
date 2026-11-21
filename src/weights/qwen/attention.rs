@@ -48,7 +48,7 @@ impl Memory {
             2,
             c.embedding.vocabulary,
         )?;
-        let attention = AttentionScratch::plan(&mut p, batch, capacity, &q.attention)?;
+        let attention = AttentionScratch::plan(&mut p, batch, &q.attention)?;
         let states = kv_states(&mut p, q.layers.len(), capacity, &q.attention)?;
         let audio = match &q.audio {
             None => None,

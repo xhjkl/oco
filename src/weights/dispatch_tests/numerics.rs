@@ -15,7 +15,7 @@ fn gpu_argmax_rejects_nonfinite_logits_and_preserves_finite_ordering() -> Result
     let gpu = Gpu::new()?;
     let compute = Compute::new(&gpu, None);
     let mut builder = Builder::new(&gpu)?;
-    let pipeline = builder.get("argmax", WeightFormat::F32, 0)?;
+    let pipeline = builder.get("argmax_f32", WeightFormat::F32, 0)?;
     let mut cases = Vec::new();
     for bits in [0x7f80, 0xff80, 0x7fc1, 0xffc1, 0x7f81] {
         let mut input = vec![bf16::from_f32(2.0).to_bits(); 2051];
@@ -36,7 +36,9 @@ fn gpu_argmax_rejects_nonfinite_logits_and_preserves_finite_ordering() -> Result
         cases.push((input, tied[0] as u32));
     }
     for (input, expected) in cases {
-        let x = buffer(&gpu, &input);
+        // Widening each BF16 case exactly: the FP32 logits keep every class and ordering.
+        let logits: Vec<u32> = input.iter().map(|&bits| u32::from(bits) << 16).collect();
+        let x = buffer(&gpu, &logits);
         let mut output = vec![SENTINEL; 1 + 2 * GUARD];
         let y = buffer(&gpu, &output);
         let n = input.len() as u32;

@@ -5,7 +5,7 @@ use crate::{
         common::AttentionProjections,
         gpt_oss::SinkAttention,
         operands::Projection,
-        pipelines::{AttentionDispatch, AttentionPipelines, GatedAttentionPipelines},
+        pipelines::{AttentionPipelines, GatedAttentionPipelines},
         qwen::attention::GatedAttention,
         state::{AttentionScratch, Kv},
     },
@@ -85,13 +85,6 @@ impl AttentionParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct SplitAttentionParams {
-    attention: AttentionParams,
-    splits: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
 struct QkNorm {
     dim: u32,
     /// Query head stride in head widths: 2 interleaves a gate after each query head.
@@ -119,14 +112,9 @@ pub struct AttentionPlan {
 }
 
 impl AttentionPlan {
-    pub const SPLIT_MIN_KEYS: usize = 4096;
-
-    /// Fixed fan-out measured on long-context Qwen and GPT-OSS attention.
-    pub const SPLITS: usize = 32;
-
-    /// Select measured full-chunk geometries; other shapes keep their existing dispatch choices.
+    /// Full 512-row chunks of GPT-OSS's 64-wide heads, where sixteen-query tiles share keys.
     fn wide_prefill(dim: usize, rows: usize, window: usize) -> bool {
-        rows == 512 && ((dim == 256 && window == 0) || (dim == 64 && matches!(window, 0 | 128)))
+        rows == 512 && dim == 64 && matches!(window, 0 | 128)
     }
 
     pub fn new(rope: Rope, pipelines: AttentionPipelines) -> Self {
@@ -140,16 +128,6 @@ impl AttentionPlan {
             scale: 1.0 / (rope.dim as f32).sqrt(),
             rope,
             pipelines,
-        }
-    }
-}
-
-impl AttentionDispatch {
-    /// Kernel and threadgroup size for batches too short for the tiled kernels.
-    pub fn select(&self) -> (&crate::gpu::Pipeline, usize) {
-        match self {
-            Self::Vector(p) => (p, 256),
-            Self::Plain(p) => (p, 1024),
         }
     }
 }
@@ -313,14 +291,12 @@ impl Bindings<'_> {
             return;
         }
         let pos = positions.start + output.start;
-        let keys = pos + output.len();
-        let keys = if window == 0 { keys } else { keys.min(window) };
         let p = AttentionParams {
             window: window as u32,
             sinks: sinks.is_some() as u32,
             ..AttentionParams::new(plan, pos, output.len(), 0)
         };
-        self.attend(plan, s, state, s.rotated.at(0), sinks, p, keys);
+        self.attend(plan, s, state, s.rotated.at(0), sinks, p);
     }
 
     /// Mix every one of `rows` encoder rows against the first `keys` of them, with no causal
@@ -337,7 +313,7 @@ impl Bindings<'_> {
         self.project_qkv(w, s, rows, 0..rows);
         self.rotate(plan, s, state, 0..rows, 0..rows);
         let p = AttentionParams::new(plan, 0, rows, keys);
-        self.attend(plan, s, state, s.rotated.at(0), None, p, keys);
+        self.attend(plan, s, state, s.rotated.at(0), None, p);
         w.out
             .apply(self, s.mixed.at(0), &self.scratch.projected, rows);
     }
@@ -358,7 +334,7 @@ impl Bindings<'_> {
         self.prepare_norm_scales(&[&q.matrix], rows, 0..rows);
         q.apply_norm(self, &s.q, rows);
         let p = AttentionParams::new(plan, 0, rows, keys);
-        self.attend(plan, s, cross, s.q.at(0), None, p, keys);
+        self.attend(plan, s, cross, s.q.at(0), None, p);
         out.apply(self, s.mixed.at(0), &self.scratch.projected, rows);
     }
 
@@ -443,9 +419,9 @@ impl Bindings<'_> {
         }
     }
 
-    /// Score `p.m` query rows against the stored keys and write the mixed rows.
-    /// `keys` counts the keys the longest row reads, which selects the kernel.
-    #[allow(clippy::too_many_arguments)]
+    /// Score `p.m` query rows against the stored keys and write the mixed rows. Single queries
+    /// take the one-pass vector kernel at every history length: splitting the keys across
+    /// threadgroups measured slower at 1k-32k keys for both checkpoints' head geometries.
     fn attend(
         &self,
         plan: &AttentionPlan,
@@ -454,7 +430,6 @@ impl Bindings<'_> {
         q: (&BufferRef, usize),
         sinks: Option<&ReadOnly>,
         p: AttentionParams,
-        keys: usize,
     ) {
         let e = self.encoder;
         let m = p.m as usize;
@@ -462,47 +437,10 @@ impl Bindings<'_> {
         let sinks = sinks
             .map(ReadOnly::binding)
             .unwrap_or(self.scratch.next.at(0));
-        // Splitting keys pays off only for grouped-query decoding over long causal history;
-        // cross-attention's single-head groups would leave most of each tile idle.
-        if m == 1
-            && p.keys == 0
-            && keys >= AttentionPlan::SPLIT_MIN_KEYS
-            && let (Some(pipelines), Some(partials)) = (&plan.pipelines.split, &s.partials)
-        {
-            let splits = AttentionPlan::SPLITS;
-            let params = SplitAttentionParams {
-                attention: p,
-                splits: splits as u32,
-            };
-            let ratio = plan.rope.heads as usize / plan.rope.kv_heads as usize;
-            let head_tiles = ratio.div_ceil(8);
-            dispatch(
-                e,
-                &pipelines.partial,
-                &[
-                    q,
-                    state.k.binding(),
-                    state.v.binding(),
-                    sinks,
-                    partials.at(0),
-                ],
-                bytes_of(&params),
-                [plan.rope.kv_heads as usize * head_tiles, 1, splits],
-                128,
-            );
-            // Ordering the merge after every independent key partition has published its FP32 result.
-            dispatch(
-                e,
-                &pipelines.merge,
-                &[partials.at(0), s.mixed.at(0)],
-                bytes_of(&params),
-                [plan.rope.heads as usize, 1, 1],
-                128,
-            );
-            return;
-        }
         let heads = plan.rope.heads as usize;
         let pipelines = &plan.pipelines;
+        // Other rows take one vector threadgroup per head and row: for Qwen3.8's 256-wide heads
+        // it measured 1.6-6x faster than query tiles at 8-512 rows over 0-8k keys of history.
         let (pipeline, threads, groups) =
             match (&pipelines.block, &pipelines.wide, &pipelines.tiled) {
                 // Bidirectional batches share every key across all rows; the block tiles amortize them.
@@ -515,10 +453,7 @@ impl Bindings<'_> {
                     (pipeline, 128, [heads, m.div_ceil(16), 1])
                 }
                 (_, _, Some(pipeline)) if m >= 8 => (pipeline, 128, [heads, m.div_ceil(8), 1]),
-                _ => {
-                    let (pipeline, threads) = plan.pipelines.dispatch.select();
-                    (pipeline, threads, [plan.rope.heads as usize, m, 1])
-                }
+                _ => (&pipelines.vector, 256, [heads, m, 1]),
             };
         dispatch(
             e,

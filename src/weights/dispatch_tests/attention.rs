@@ -14,10 +14,91 @@ use crate::{
 use anyhow::Result;
 use half::{bf16, f16};
 
-#[path = "attention_split.rs"]
-mod split;
 #[path = "attention_wide.rs"]
 mod wide;
+
+/// Rotate keys at positions an agent context reaches, against an exact reference. Base 1
+/// makes every angle the position itself, isolating the trigonometry; the checkpoints' bases
+/// also exercise the frequency, allowed eight FP32 steps plus the rounding of the angle.
+/// Fast-math sine and cosine already miss the first bound at 4k positions.
+#[test]
+fn gpu_rope_matches_reference_at_long_positions() -> Result<()> {
+    let gpu = Gpu::new()?;
+    let compute = Compute::new(&gpu, None);
+    let mut builder = Builder::new(&gpu)?;
+    let pipeline = builder.get("rope", WeightFormat::F32, 0)?;
+    let dim = 64;
+    let keys: Vec<_> = (0..dim)
+        .map(|i| bf16::from_f32(((i * 37 + 11) % 251) as f32 / 64.0 - 2.0).to_bits())
+        .collect();
+    let value = |i: usize| bf16::from_bits(keys[i]).to_f64();
+    let k = buffer(&gpu, &keys);
+    let unused = buffer(&gpu, &[0u16; 1]);
+    for (base, frequency_steps) in [(1.0f32, 0.0), (150_000.0, 8.0), (10_000_000.0, 8.0)] {
+        for position in [4095usize, 16383, 32767, 65535] {
+            let cache = buffer(&gpu, &vec![0u16; (position + 1) * dim]);
+            let rope = Rope {
+                heads: 0,
+                kv_heads: 1,
+                dim: dim as u32,
+                rope_dim: dim as u32,
+                m: 1,
+                pos: position as u32,
+                q_stride: 1,
+                base,
+                factor: 1.0,
+                low: 0.0,
+                high: 1.0,
+                scale: 1.0,
+            };
+            let submission = compute.submit(|encoder| {
+                dispatch(
+                    encoder,
+                    &pipeline,
+                    &[
+                        (&unused, 0),
+                        (&k, 0),
+                        (&unused, 0),
+                        (&unused, 0),
+                        (&cache, 0),
+                        (&unused, 0),
+                    ],
+                    bytemuck::bytes_of(&rope),
+                    [1, 1, 1],
+                    256,
+                );
+            });
+            futures_lite::future::block_on(submission)?;
+            let mut rotated = vec![0u16; (position + 1) * dim];
+            read(&cache, &mut rotated);
+            let half = dim / 2;
+            for d in 0..dim {
+                let pair = (d % half) as f64;
+                let theta = position as f64 * f64::from(base).powf(-2.0 * pair / dim as f64);
+                let (other, sign) = if d < half {
+                    (d + half, -1.0)
+                } else {
+                    (d - half, 1.0)
+                };
+                let want = value(d) * theta.cos() + sign * value(other) * theta.sin();
+                let got = f16::from_bits(rotated[position * dim + d]).to_f64();
+                let angle = if frequency_steps == 0.0 {
+                    0.0
+                } else {
+                    (frequency_steps + 0.5) * theta * f64::from(f32::EPSILON) / 2.0
+                };
+                // One half-precision step at the reference's magnitude covers its rounding.
+                let step = want.abs().max(f64::from(f16::MIN_POSITIVE)) * f64::from(f16::EPSILON);
+                let tolerance = (value(d).abs() + value(other).abs()) * angle + step;
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "base {base}, position {position}, d {d}: {got} vs {want}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Preserve KV writes when only the last query is consumed or no query is consumed.
 #[test]

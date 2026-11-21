@@ -24,7 +24,8 @@ pub struct Inference<'a> {
 /// Next operation, including an abort marker installed before any GPU wait.
 enum Phase<'a> {
     Prefill(Cow<'a, [u32]>),
-    Decode,
+    /// Feed back the last returned prediction.
+    Decode(u32),
     Complete,
     Aborted,
 }
@@ -35,6 +36,7 @@ impl Session {
     /// Supply only the new suffix. The last emitted prediction has not been consumed;
     /// include it in this input if continuing a previous run. Input must be nonempty,
     /// contain valid token IDs, and fit the remaining session capacity.
+    /// IDs a [`Session::rewind`] left to replay are consumed first, in the same prefill.
     /// Validation leaves the session unchanged; GPU work starts on the first pull.
     pub fn infer<'a>(&'a mut self, tokens: impl Into<Cow<'a, [u32]>>) -> Result<Inference<'a>> {
         let tokens = tokens.into();
@@ -73,13 +75,13 @@ impl<'a> Inference<'a> {
                 return Ok(None);
             }
             Phase::Prefill(input) => self.session.prefill(&input).await?,
-            Phase::Decode => self.session.decode().await?,
+            Phase::Decode(token) => self.session.decode(token).await?,
         };
         let position = self.session.position()?;
         self.phase = if position == self.session.capacity {
             Phase::Complete
         } else {
-            Phase::Decode
+            Phase::Decode(token)
         };
         Ok(Some(token))
     }

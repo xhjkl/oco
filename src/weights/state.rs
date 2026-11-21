@@ -22,6 +22,9 @@ use anyhow::{Context, Result};
 /// Maximum prompt tokens processed per submission, bounding scratch independently of history length.
 pub const MAX_PREFILL_ROWS: usize = 512;
 
+/// Rows times K splits that the partial sums of one short-batch product may occupy.
+pub const SPLIT_ROWS: usize = 64;
+
 /// Intermediate representations reused as tokens pass through successive model layers.
 pub struct CommonScratch<S = BufferView> {
     pub input: S,
@@ -40,6 +43,8 @@ pub struct CommonScratch<S = BufferView> {
     pub logits: S,
     /// Greedy next-token ID, reused directly as decode input without a CPU-to-GPU copy.
     pub next: S,
+    /// FP32 sums of K-split short-batch products, one layer per split.
+    pub partials: S,
 }
 
 /// Temporary queries, keys, and values used to read from and extend one layer's attention history.
@@ -49,8 +54,6 @@ pub struct AttentionScratch<S = BufferView> {
     pub v: S,
     pub mixed: S,
     pub rotated: S,
-    /// FP32 split-attention peak, mass and weighted values, reused across layers for one live query.
-    pub partials: Option<S>,
 }
 
 /// Per-chunk intermediates for updating recurrent memory and producing token features.
@@ -167,6 +170,7 @@ impl CommonScratch<Slot> {
             )?,
             logits: plan.slot(vocabulary, 4)?,
             next: plan.slot(1, 4)?,
+            partials: plan.slot(product(SPLIT_ROWS, hidden.max(ffn_width))?, 4)?,
         })
     }
 
@@ -182,49 +186,29 @@ impl CommonScratch<Slot> {
             up: a.get(self.up),
             logits: a.get(self.logits),
             next: a.get(self.next),
+            partials: a.get(self.partials),
         }
     }
 }
 
 impl AttentionScratch<Slot> {
-    pub fn plan(p: &mut Plan, batch: usize, capacity: usize, a: &AttentionPlan) -> Result<Self> {
-        let partials = Self::plan_partials(p, capacity, a)?;
+    pub fn plan(p: &mut Plan, batch: usize, a: &AttentionPlan) -> Result<Self> {
         Ok(Self {
             q: p.slot(product(batch, a.query_width)?, 2)?,
             k: p.slot(product(batch, a.key_width)?, 2)?,
             v: p.slot(product(batch, a.key_width)?, 2)?,
             mixed: p.slot(product(batch, a.output_width)?, 2)?,
             rotated: p.slot(product(batch, a.output_width)?, 2)?,
-            partials,
         })
     }
 
-    /// Reserve fixed-fan-out partials only for sessions that can reach the long-context selector.
-    pub fn plan_partials(p: &mut Plan, capacity: usize, a: &AttentionPlan) -> Result<Option<Slot>> {
-        if capacity < AttentionPlan::SPLIT_MIN_KEYS || a.pipelines.split.is_none() {
-            return Ok(None);
-        }
-        let rows = product(a.rope.heads as usize, AttentionPlan::SPLITS)?;
-        let elements = product(rows, a.rope.dim as usize + 2)?;
-        let partials = p.slot(elements, 4)?;
-        Ok(Some(partials))
-    }
-
     pub fn bind(self, a: &Arena) -> AttentionScratch {
-        let partials = match self.partials {
-            None => None,
-            Some(slot) => {
-                let partials = a.get(slot);
-                Some(partials)
-            }
-        };
         AttentionScratch {
             q: a.get(self.q),
             k: a.get(self.k),
             v: a.get(self.v),
             mixed: a.get(self.mixed),
             rotated: a.get(self.rotated),
-            partials,
         }
     }
 }
@@ -257,6 +241,11 @@ impl DeltaScratch<Slot> {
             values: a.get(self.values),
         }
     }
+}
+
+/// Bytes one position of capacity adds to `count` layers' [`kv_states`]: a key and a value row each.
+pub fn kv_position_bytes(count: usize, a: &AttentionPlan) -> usize {
+    count * 2 * a.key_width * 2
 }
 
 pub fn kv_states(

@@ -23,7 +23,10 @@ kernel void rope(const device bfloat *q [[buffer(0)]], const device bfloat *k [[
         float ramp = clamp((float(pair) - p.low) / (p.high - p.low), 0.0f, 1.0f);
         freq *= 1.0f - ramp + ramp / p.factor;
         float theta = float(p.pos + t) * freq;
-        a = (a * cos(theta) + (d < halfdim ? -1.0f : 1.0f) * float(src[other]) * sin(theta)) *
+        // Precise sine and cosine: fast-math versions lose accuracy in proportion to the angle,
+        // which grows with the position (about 3e-3 absolute at 32k tokens).
+        a = (a * precise::cos(theta) +
+             (d < halfdim ? -1.0f : 1.0f) * float(src[other]) * precise::sin(theta)) *
             p.scale;
     }
     if (isq)
@@ -42,58 +45,12 @@ struct AttentionParams {
     // cross-attention); zero keeps causal attention through each query's own position.
     uint keys;
 };
+// Keys and values are retained as half so the query tiles can load them straight into
+// SIMD-group matrices.
 // Exclusive end of the keys visible to the query at chunk row `t`.
 inline uint key_end(constant AttentionParams &p, uint t) {
     return p.keys ? p.keys : p.pos + t + 1;
 }
-// Keys and values are retained as half so prefill can load them straight into SIMD-group matrices.
-// Online softmax and cross-SIMD reduction, with contiguous KV storage.
-[[kernel, max_total_threads_per_threadgroup(1024)]] void attention(const device bfloat *q [[buffer(0)]], const device half *k [[buffer(1)]],
-                      const device half *v [[buffer(2)]], const device float *sinks [[buffer(3)]],
-                      device bfloat *out [[buffer(4)]], constant AttentionParams &p [[buffer(5)]],
-                      uint3 group [[threadgroup_position_in_grid]],
-                      uint tid [[thread_index_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]],
-                      uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float maxs[32], sums[32], outputs[1024];
-    uint h = group.x, t = group.y, kv = h / (p.heads / p.kv_heads), elems = p.dim / 32;
-    float qq[8], oo[8];
-    for (uint j = 0; j < elems; j++) {
-        qq[j] = float(q[(t * p.heads + h) * p.dim + lane * elems + j]) * p.scale;
-        oo[j] = 0;
-    }
-    float mx = p.sinks && sg == 0 ? float(bfloat(sinks[h])) : -INFINITY,
-          sm = p.sinks && sg == 0 ? 1 : 0;
-    uint end = key_end(p, t), begin = p.window && end > p.window ? end - p.window : 0;
-    for (uint s = begin + sg; s < end; s += 32) {
-        float score = 0;
-        for (uint j = 0; j < elems; j++)
-            score += qq[j] * float(k[(s * p.kv_heads + kv) * p.dim + lane * elems + j]);
-        score = simd_sum(score);
-        float nm = max(mx, score), f = fast::exp(mx - nm), e = fast::exp(score - nm);
-        sm = sm * f + e;
-        mx = nm;
-        for (uint j = 0; j < elems; j++)
-            oo[j] = oo[j] * f + e * float(v[(s * p.kv_heads + kv) * p.dim + lane * elems + j]);
-    }
-    if (lane == 0) {
-        maxs[sg] = mx;
-        sums[sg] = sm;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float global = simd_max(maxs[lane]);
-    float factor = fast::exp(maxs[lane] - global);
-    float den = simd_sum(sums[lane] * factor);
-    for (uint j = 0; j < elems; j++) {
-        outputs[lane * 32 + sg] = oo[j];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float val = simd_sum(outputs[sg * 32 + lane] * factor) / den;
-        if (lane == 0)
-            out[(t * p.heads + h) * p.dim + sg * elems + j] = bfloat(val);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
 // Query-tiled attention for prompts: eight queries of one head per threadgroup and 32 keys per
 // step. Scores and weighted values use SIMD-group matrices with FP32 accumulation; the online
 // softmax runs in FP32 with half probabilities. Each SIMD group scores eight keys, then

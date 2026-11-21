@@ -37,7 +37,9 @@ pub struct Decoder<'a> {
 }
 
 impl Tokenizer {
-    pub(crate) fn load(file: &Gguf, vocabulary: usize) -> Result<Self> {
+    /// Build the codec from checkpoint metadata alone, so it can run beside the GPU import;
+    /// the caller checks [`Self::vocabulary`] against the embedding table.
+    pub(crate) fn load(file: &Gguf) -> Result<Self> {
         ensure!(
             file.text("tokenizer.ggml.model")? == "gpt2",
             "unsupported tokenizer model"
@@ -61,9 +63,10 @@ impl Tokenizer {
         };
         let tokens = file.strings("tokenizer.ggml.tokens")?;
         let kinds = file.integers("tokenizer.ggml.token_type")?;
+        let vocabulary = tokens.len();
         ensure!(
-            tokens.len() == vocabulary && kinds.len() == vocabulary,
-            "tokenizer vocabulary does not match model weights"
+            kinds.len() == vocabulary,
+            "tokenizer token kinds do not match its vocabulary"
         );
         let kinds = kinds
             .into_iter()
@@ -181,6 +184,11 @@ impl Tokenizer {
             TokenKind::Control | TokenKind::UserDefined => Some(id),
             _ => None,
         }
+    }
+
+    /// Count the token IDs the codec can decode.
+    pub(crate) fn vocabulary(&self) -> usize {
+        self.kinds.len()
     }
 
     pub fn token_kind(&self, id: u32) -> Option<TokenKind> {
