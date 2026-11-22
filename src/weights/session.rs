@@ -285,10 +285,10 @@ impl Session {
 
     /// Keep only the first `position` consumed tokens; the next `infer` continues after them.
     ///
-    /// Attention caches rewind in place. Recurrent memory returns to the newest checkpoint at
-    /// or before `position` (the empty sequence always counts as one), and the next `infer`
-    /// re-consumes the retained IDs between that checkpoint and `position` before its own
-    /// input. Checkpoints past `position` are forgotten.
+    /// Capacity-long attention caches rewind in place. Recurrent memory and ring caches return
+    /// to the newest checkpoint at or before `position` (the empty sequence always counts as
+    /// one), and the next `infer` re-consumes the retained IDs between that checkpoint and
+    /// `position` before its own input. Checkpoints past `position` are forgotten.
     pub fn rewind(&mut self, position: usize) -> Result<()> {
         let resident = self.resident()?;
         ensure!(
@@ -304,7 +304,7 @@ impl Session {
             [] => position,
             recurrent => match self.checkpoints.last() {
                 Some(checkpoint) => {
-                    self.restore(&checkpoint.state);
+                    self.restore(&checkpoint.state, checkpoint.position);
                     checkpoint.position
                 }
                 // Restoring the empty sequence, whose memory is all zeros.
@@ -321,8 +321,10 @@ impl Session {
     /// Remember recurrent memory at the current position so later rewinds to it, or past it,
     /// replay nothing before it. A session retains its earliest and its most recent checkpoint.
     /// Each is a host copy of all recurrent memory (about 150 MiB for Qwen3.8-27B, the same
-    /// bytes every saved context carries); attention-only models store nothing. The empty
-    /// sequence needs no checkpoint, so taking one there does nothing.
+    /// bytes every saved context carries), plus the filled rows of any ring caches (up to
+    /// 240 MiB per checkpoint for Inkling 2 Mini sessions longer than 1536 positions, which
+    /// [`Weights::capacity_within`] does not count); attention-only models store nothing. The
+    /// empty sequence needs no checkpoint, so taking one there does nothing.
     ///
     /// To checkpoint a prompt without an extra forward pass, pull its first prediction, drop
     /// the `Inference`, call this, and continue with `infer(vec![prediction])`: that prefill
@@ -339,23 +341,64 @@ impl Session {
         {
             return Ok(());
         }
-        // Reusing the replaced checkpoint's allocation for the same fixed-size memory.
-        let mut state = match self.checkpoints.len() {
+        // Reusing the replaced checkpoint's allocation.
+        let state = match self.checkpoints.len() {
             2 => self.checkpoints.pop().map(|c| c.state).unwrap_or_default(),
             _ => Vec::new(),
         };
-        let total = self.recurrent_views().map(BufferView::length).sum();
-        if state.len() != total {
-            state = vec![0; total];
-        }
+        let state = self.snapshot(position, state);
+        self.checkpoints.push(Checkpoint { position, state });
+        Ok(())
+    }
+
+    /// Copy recurrent memory and the rows ring caches hold at `position` into `state`.
+    fn snapshot(&self, position: usize, mut state: Vec<u8>) -> Vec<u8> {
+        let recurrent = self.recurrent_views().map(BufferView::length).sum();
+        state.resize(recurrent, 0);
         let mut offset = 0;
         for view in self.recurrent_views() {
             let end = offset + view.length();
             view.read(&mut state[offset..end]);
             offset = end;
         }
-        self.checkpoints.push(Checkpoint { position, state });
-        Ok(())
+        self.append_rings(position, state)
+    }
+
+    /// Append the rows ring caches hold at `position` to a copy of recurrent memory.
+    fn append_rings(&self, position: usize, mut state: Vec<u8>) -> Vec<u8> {
+        let mut offset = state.len();
+        state.resize(offset + self.ring_bytes(position), 0);
+        for (kv, ring) in self.histories() {
+            if ring > 0 {
+                let rows = position.min(ring) * self.kv_row_bytes();
+                for view in [&kv.k, &kv.v] {
+                    view.read(&mut state[offset..offset + rows]);
+                    offset += rows;
+                }
+            }
+        }
+        state
+    }
+
+    /// Bytes of the rows ring caches hold at `position`: a prefix until the ring first fills,
+    /// then all of it.
+    fn ring_bytes(&self, position: usize) -> usize {
+        self.histories()
+            .filter(|&(_, ring)| ring > 0)
+            .map(|(_, ring)| 2 * position.min(ring) * self.kv_row_bytes())
+            .sum()
+    }
+
+    /// Every attention history in layer (visit) order with its ring size in rows, or zero for
+    /// a capacity-long cache.
+    fn histories(&self) -> impl Iterator<Item = (&Kv, usize)> {
+        let caches: Box<dyn Iterator<Item = (&Kv, usize)>> = match &self.inner {
+            Execution::Inkling { memory, .. } => {
+                Box::new(memory.caches.iter().map(|(kv, ring)| (kv, *ring)))
+            }
+            _ => Box::new(self.kv().iter().map(|kv| (kv, 0))),
+        };
+        caches
     }
 
     /// Per-layer attention history, in layer order.
@@ -375,13 +418,22 @@ impl Session {
         self.recurrent().iter().flat_map(|r| [&r.conv, &r.ssm])
     }
 
-    /// Overwrite recurrent memory with `state`, laid out as [`Self::recurrent_views`].
-    fn restore(&self, state: &[u8]) {
+    /// Overwrite recurrent memory and ring caches with a [`Self::snapshot`] taken at `position`.
+    fn restore(&self, state: &[u8], position: usize) {
         let mut offset = 0;
         for view in self.recurrent_views() {
             let end = offset + view.length();
             view.write(0, &state[offset..end]);
             offset = end;
+        }
+        for (kv, ring) in self.histories() {
+            if ring > 0 {
+                let rows = position.min(ring) * self.kv_row_bytes();
+                for view in [&kv.k, &kv.v] {
+                    view.write(0, &state[offset..offset + rows]);
+                    offset += rows;
+                }
+            }
         }
     }
 

@@ -2,9 +2,12 @@
 //!
 //! Layout, little-endian: consumed and resident counts, the consumed IDs, then each attention
 //! layer's resident key and value rows and each recurrent layer's convolution and state memory,
-//! all in layer order. Files carry no identity: the caller names them by the weights, build,
-//! and IDs that produced them, and a file opened for anything else restores garbage.
-use super::{Architecture, Checkpoint, Progress, Session};
+//! all in layer order. A ring cache (Inkling's sliding-window layers in long sessions) stores
+//! its rows from row zero up to the smaller of `resident` and its size, in ring order: the same
+//! bytes a linear cache holds for any context short enough for one. Files carry no identity:
+//! the caller names them by the weights, build, and IDs that produced them, and a file opened
+//! for anything else restores garbage. A file whose length does not match is refused.
+use super::{Architecture, Checkpoint, Kv, Progress, Session};
 use crate::error::{Context, Error, Result, ensure};
 use crate::gpu::BufferView;
 use std::{
@@ -51,8 +54,7 @@ impl Session {
         file.write_all(&(self.history.len() as u64).to_le_bytes())?;
         file.write_all(&(resident as u64).to_le_bytes())?;
         file.write_all(bytemuck::cast_slice(&self.history))?;
-        let rows = resident * self.kv_row_bytes();
-        for kv in self.kv() {
+        for (kv, rows) in self.saved_rows(resident) {
             kv.k.store(rows, &mut file)?;
             kv.v.store(rows, &mut file)?;
         }
@@ -86,31 +88,59 @@ impl Session {
             resident <= consumed && consumed <= capacity,
             Error::Request("saved context exceeds the session capacity")
         );
-        let rows = resident * session.kv_row_bytes();
         let state: usize = session.recurrent_views().map(BufferView::length).sum();
+        let histories: usize = session.saved_rows(resident).map(|(_, rows)| 2 * rows).sum();
+        // Truncated or overlong files are refused rather than misread.
+        let expected = 16 + 4 * consumed as u64 + (histories + state) as u64;
+        ensure!(
+            file.metadata()?.len() == expected,
+            Error::Request("saved context does not match this session")
+        );
         let mut history = vec![0u32; consumed];
         file.read_exact(bytemuck::cast_slice_mut(&mut history))?;
-        for kv in session.kv() {
+        for (kv, rows) in session.saved_rows(resident) {
             kv.k.load(rows, &mut file)?;
             kv.v.load(rows, &mut file)?;
         }
-        // Reading recurrent memory once into its checkpoint, then copying it into place.
         let mut state = vec![0; state];
         file.read_exact(&mut state)?;
-        session.restore(&state);
+        let mut offset = 0;
+        for view in session.recurrent_views() {
+            view.write(0, &state[offset..offset + view.length()]);
+            offset += view.length();
+        }
+        // Checkpointing there, with the ring rows just loaded; the empty sequence needs none.
         session.history = history;
-        session.checkpoints = vec![Checkpoint {
-            position: resident,
-            state,
-        }];
+        if resident > 0 {
+            let state = session.append_rings(resident, state);
+            session.checkpoints = vec![Checkpoint {
+                position: resident,
+                state,
+            }];
+        }
         session.progress = Progress::Ready { resident };
         Ok(session)
     }
 
+    /// Each history with the bytes of its keys (and of its values) a save at `resident` holds:
+    /// every resident row, or a ring's rows from row zero. A session short enough for linear
+    /// caches holds at most a ring's worth, so files carry the same rows either way.
+    fn saved_rows(&self, resident: usize) -> impl Iterator<Item = (&Kv, usize)> {
+        let row = self.kv_row_bytes();
+        self.histories().map(move |(kv, ring)| {
+            let rows = if ring > 0 {
+                resident.min(ring)
+            } else {
+                resident
+            };
+            (kv, rows * row)
+        })
+    }
+
     /// Bytes of one position's keys (or values) in one attention layer's cache.
-    fn kv_row_bytes(&self) -> usize {
-        self.kv()
-            .first()
-            .map_or(0, |kv| kv.k.length() / self.capacity)
+    pub(super) fn kv_row_bytes(&self) -> usize {
+        self.histories().next().map_or(0, |(kv, ring)| {
+            kv.k.length() / if ring > 0 { ring } else { self.capacity }
+        })
     }
 }

@@ -59,21 +59,38 @@ fn reuse(variable: &str) -> Result<()> {
     };
     let _gpu = GPU.lock().unwrap_or_else(|error| error.into_inner());
     let weights = oco::load(path)?;
-    let ids = prompt(
-        weights.tokenizer(),
-        "You are a helpful assistant. For any question about the weather, you must call the get_weather function instead of answering from memory.",
-        "What's the weather like in Paris right now? Also tell me whether I need an umbrella.",
-        Some(&WEATHER),
-    )?;
+    let system = "You are a helpful assistant. For any question about the weather, you must call the get_weather function instead of answering from memory.";
+    let user =
+        "What's the weather like in Paris right now? Also tell me whether I need an umbrella.";
+    let ids = prompt(weights.tokenizer(), system, user, Some(&WEATHER))?;
     // Recurrent models replay rewound IDs in exactly the original prefill; attention-only
     // models recompute rewound rows in place, as the suffix-append path does.
     let recurrent = family(weights.tokenizer()) != Family::GptOss;
-    let split = ids.len() - TAIL;
-    let (preamble, tail) = ids.split_at(split);
-    let capacity = ids.len() + 2 * GENERATED;
+    let mut cases = vec![ids.clone()];
+    if family(weights.tokenizer()) == Family::Inkling {
+        // Inkling keeps its sliding-window caches in 1536-row rings only in longer sessions:
+        // a prompt past two rings wraps them before and after the checkpoint.
+        let notes = "Field notes: the station logs pressure, humidity and wind every hour, and the archive keeps each reading with its time and place. ".repeat(140);
+        let long = prompt(
+            weights.tokenizer(),
+            &format!("{system}\n\n{notes}"),
+            user,
+            Some(&WEATHER),
+        )?;
+        assert!(
+            long.len() > 3072,
+            "the long prompt must wrap the rings twice"
+        );
+        cross_layout(&weights, &ids)?;
+        cases.push(long);
+    }
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-    runtime.block_on(async {
-        let fresh = generate(&mut weights.new_session(capacity)?, &ids).await?;
+    for ids in &cases {
+        let split = ids.len() - TAIL;
+        let (preamble, tail) = ids.split_at(split);
+        let capacity = ids.len() + 2 * GENERATED;
+        runtime.block_on(async {
+        let fresh = generate(&mut weights.new_session(capacity)?, ids).await?;
 
         // Checkpointing the consumed preamble costs no forward pass of its own.
         let mut session = weights.new_session(capacity)?;
@@ -102,7 +119,7 @@ fn reuse(variable: &str) -> Result<()> {
 
         // Continuing through the first prediction matches plain decoding.
         let mut continued = weights.new_session(capacity)?;
-        let mut inference = continued.infer(&ids)?;
+        let mut inference = continued.infer(&ids[..])?;
         let head = inference.next().await?.ok_or("no prediction")?;
         drop(inference);
         continued.checkpoint()?;
@@ -115,6 +132,23 @@ fn reuse(variable: &str) -> Result<()> {
         let open = started.elapsed();
         assert_eq!(opened.history(), preamble);
         assert_eq!(generate(&mut opened, tail).await?, appended);
+        if preamble.len() > 1536 {
+            // A wrapped Inkling ring opens into a longer session's ring unchanged.
+            let mut longer = weights.open_session(&file, 2 * capacity)?;
+            assert_eq!(generate(&mut longer, tail).await?, appended, "longer session");
+            // Rewinding to the checkpoint after a full ring of other rows overwrote every key
+            // it needs restores them: saving there reproduces the original file exactly.
+            let mut far = weights.open_session(&file, 2 * capacity)?;
+            let other: Vec<u32> = preamble.iter().rev().take(1600).copied().collect();
+            far.infer(other)?.next().await?.ok_or("no prediction")?;
+            far.rewind(split)?;
+            let copy = file.with_extension("rewound");
+            far.save(&copy)?;
+            let same = std::fs::read(&copy)? == std::fs::read(&file)?;
+            std::fs::remove_file(&copy)?;
+            assert!(same, "rewinding past a full ring changed the saved context");
+            assert_eq!(generate(&mut far, tail).await?, appended, "rewind after a ring");
+        }
 
         // Rewinding inside the tail replays it from the preamble checkpoint (or rewinds the
         // caches in place) and continues as the uninterrupted session did.
@@ -178,7 +212,7 @@ fn reuse(variable: &str) -> Result<()> {
         check(&generate(&mut many, &tail[12..]).await?, &appended, "rewind among checkpoints");
         session.reset()?;
         assert!(session.history().is_empty());
-        assert_eq!(generate(&mut session, &ids).await?, fresh);
+        assert_eq!(generate(&mut session, ids).await?, fresh);
         eprintln!(
             "{variable}: open {open:.2?}, rewind + {} ID prefill + {GENERATED} tokens {replay:.2?}; first preamble prediction {first}",
             tail.len() - 5
@@ -189,13 +223,46 @@ fn reuse(variable: &str) -> Result<()> {
         let contents = std::fs::read(&file)?;
         std::fs::write(&file, &contents[..contents.len() - 1])?;
         assert!(weights.open_session(&file, capacity).is_err());
+        std::fs::write(&file, [&contents[..], &[0]].concat())?;
+        assert!(weights.open_session(&file, capacity).is_err());
         std::fs::write(&file, b"not a context")?;
         assert!(weights.open_session(&file, capacity).is_err());
         std::fs::remove_file(&file)?;
         assert!(weights.open_session(&file, capacity).is_err());
         Result::Ok(())
     })?;
+    }
     check_capacity(&weights)
+}
+
+/// Inkling contexts saved from linear caches open into ring caches and back, unchanged.
+fn cross_layout(weights: &Weights, ids: &[u32]) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    runtime.block_on(async {
+        let (preamble, tail) = ids.split_at(ids.len() - TAIL);
+        let (linear, ringed) = (ids.len() + GENERATED, 4096);
+        let file = std::env::temp_dir().join(format!("oco-layout-{}.ctx", std::process::id()));
+        let mut expected = None;
+        for (saving, opening) in [(linear, ringed), (ringed, linear)] {
+            let mut session = weights.new_session(saving)?;
+            session
+                .infer(preamble)?
+                .next()
+                .await?
+                .ok_or("no prediction")?;
+            session.save(&file)?;
+            let own = generate(&mut weights.open_session(&file, saving)?, tail).await?;
+            let other = generate(&mut weights.open_session(&file, opening)?, tail).await?;
+            assert_eq!(
+                own, other,
+                "a {saving}-position save opened at {opening} positions"
+            );
+            let expected = expected.get_or_insert(own.clone());
+            assert_eq!(&own, expected, "linear and ring caches disagree");
+        }
+        std::fs::remove_file(&file)?;
+        Result::Ok(())
+    })
 }
 
 /// A saved context larger than the opening session must be refused.

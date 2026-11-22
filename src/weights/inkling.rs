@@ -122,17 +122,69 @@ pub struct Memory {
     pub common: CommonScratch,
     pub scratch: InklingScratch,
     pub routing: Routing,
-    /// One history per layer visit, in visit order.
+    /// The capacity-long histories, in visit order: every visit's, or with ring caches only
+    /// the full-attention visits'.
     pub kv_states: Vec<Kv>,
     /// Convolution state of every visit (keys, values, attention and FFN outputs), as
     /// recurrent memory so checkpoints and rewinds treat it like other recurrences.
     pub recurrent: Vec<Recurrence>,
+    /// Each visit's cache, in visit order, and its ring size in rows (zero for a capacity-long
+    /// history). Position `p` of a ring is its row `p % ring`.
+    pub caches: Vec<(Kv, usize)>,
 }
 
 impl Inkling {
     /// Layer visits per token: prelude, every pass of the core, then the coda.
     pub fn visits(&self) -> usize {
         self.layers.len() + (self.passes - 1) * self.core.len()
+    }
+
+    /// The stored layer a visit slot runs: prelude, first core pass and coda in layer order,
+    /// then the later core passes.
+    fn slot_layer(&self, slot: usize) -> usize {
+        match slot.checked_sub(self.layers.len()) {
+            None => slot,
+            Some(later) => self.core.start + later % self.core.len(),
+        }
+    }
+
+    /// Rows of each sliding-window visit's ring cache in sessions of `capacity` positions, or
+    /// zero when a capacity-long history is no larger. A prompt chunk writes all its keys before
+    /// attending, so the ring holds the window behind the chunk's first row plus the chunk.
+    pub fn ring_rows(&self, capacity: usize) -> usize {
+        let rows = self.plan.window + MAX_PREFILL_ROWS;
+        if self.plan.window > 0 && capacity > rows {
+            rows
+        } else {
+            0
+        }
+    }
+
+    /// The largest capacity whose key and value caches fit in `free` bytes: every visit grows
+    /// with capacity up to the ring size, then only the full-attention visits do.
+    pub fn capacity_for(&self, free: usize) -> usize {
+        let row = 2 * self.plan.key_width() * 2;
+        let visits = self.visits();
+        let full = (0..visits)
+            .filter(|&slot| self.layers[self.slot_layer(slot)].full)
+            .count();
+        let ring = self.ring_rows(usize::MAX);
+        let linear = free / (visits * row);
+        if ring == 0 {
+            return linear;
+        }
+        // Past the ring size the sliding-window visits hold a fixed ring each.
+        let ringed = match (free / row).checked_sub((visits - full) * ring) {
+            None => 0,
+            // Nothing grows past the ring size.
+            Some(_) if full == 0 => usize::MAX,
+            Some(rows) => rows / full,
+        };
+        if ringed > ring {
+            ringed
+        } else {
+            linear.min(ring)
+        }
     }
 }
 
@@ -194,13 +246,27 @@ impl Memory {
         };
         let visits = n.visits();
         let elements = product(capacity, x.key_width())?;
+        let ring = n.ring_rows(capacity);
+        let ringed = |slot: usize| ring > 0 && !n.layers[n.slot_layer(slot)].full;
         let mut kv = Vec::with_capacity(visits);
         let mut conv = Vec::with_capacity(visits);
-        for _ in 0..visits {
-            kv.push(Kv {
-                k: p.slot(elements, 2)?,
-                v: p.slot(elements, 2)?,
-            });
+        let ring_elements = product(ring, x.key_width())?;
+        let mut rings = Vec::new();
+        for slot in 0..visits {
+            let rows = if ringed(slot) {
+                ring_elements
+            } else {
+                elements
+            };
+            let cache = Kv {
+                k: p.slot(rows, 2)?,
+                v: p.slot(rows, 2)?,
+            };
+            if ringed(slot) {
+                rings.push(cache);
+            } else {
+                kv.push(cache);
+            }
             conv.push(Recurrence {
                 conv: p.slot(x.conv_channels() * 3, 4)?,
                 ssm: p.slot(1, 4)?,
@@ -209,6 +275,22 @@ impl Memory {
         let a = p.allocate(&c.gpu)?;
         let get = |slot| a.get(slot);
         let s = scratch;
+        let kv_states = bind_kv_states(kv, &a);
+        let recurrent = bind_recurrence(conv, &a);
+        let (mut linear, mut rings) = (kv_states.iter(), bind_kv_states(rings, &a).into_iter());
+        let caches = (0..visits)
+            .map(|slot| match ringed(slot) {
+                true => (
+                    rings.next().expect("one ring per sliding-window visit"),
+                    ring,
+                ),
+                false => {
+                    let kv = linear.next().expect("one history per other visit");
+                    let (k, v) = (kv.k.clone(), kv.v.clone());
+                    (Kv { k, v }, 0)
+                }
+            })
+            .collect();
         Ok(Self {
             common: common.bind(&a),
             scratch: InklingScratch {
@@ -247,8 +329,9 @@ impl Memory {
                 prob: get(routing.prob),
                 plan: get(routing.plan),
             },
-            kv_states: bind_kv_states(kv, &a),
-            recurrent: bind_recurrence(conv, &a),
+            kv_states,
+            recurrent,
+            caches,
         })
     }
 }
@@ -434,7 +517,13 @@ impl Inkling {
         let plane = rows * hidden * 2;
         let input = |j: usize| s.inputs.slice(j * plane, plane);
         let inputs = [input(0), input(1), input(2)];
-        let kv = &memory.kv_states[v.slot];
+        let (kv, ring) = &memory.caches[v.slot];
+        // A longer chunk would overwrite keys its own first rows still attend to.
+        assert!(
+            *ring == 0 || rows + x.window <= *ring,
+            "a chunk must fit its ring"
+        );
+        let kv = (kv, *ring);
         let state = &memory.recurrent[v.slot].conv;
         let state_at = |channel: usize| state.at(channel * 3 * 4);
         let loops = v

@@ -62,7 +62,9 @@ impl Architecture {
     }
 
     /// Session bytes each position of capacity costs: attention keys and values, plus audio
-    /// feature rows on speech models. Everything else a session holds has a fixed size.
+    /// feature rows on speech models. Everything else a session holds has a fixed size, except
+    /// that Inkling's sliding-window caches stop growing past their ring size (see
+    /// [`inkling::Inkling::capacity_for`]); this is their cost below it.
     fn position_bytes(&self) -> usize {
         use state::kv_position_bytes;
         match self {
@@ -104,7 +106,11 @@ impl Weights {
         let base = self.inner.base();
         let budget = (base.gpu.working_set() as f64 * share) as usize;
         let free = budget.saturating_sub(base.gpu.weight_bytes());
-        let capacity = free.checked_div(self.inner.position_bytes());
+        let capacity = match &self.inner {
+            // Past the ring size, Inkling's sliding-window visits stop growing.
+            Architecture::Inkling(n) => Some(n.capacity_for(free)),
+            inner => free.checked_div(inner.position_bytes()),
+        };
         capacity.map_or(base.context, |capacity| capacity.min(base.context))
     }
 
@@ -122,8 +128,8 @@ impl Weights {
     /// Restoring copies the saved bytes straight into the session's buffers, far cheaper than
     /// prefilling them again. The file is trusted to come from these weights and this build:
     /// naming files so that holds is the caller's job. Fails, so the caller can fall back to
-    /// [`Self::new_session`] and prefill, when the file is missing, truncated, or holds more
-    /// history than `capacity`.
+    /// [`Self::new_session`] and prefill, when the file is missing, truncated or overlong, or
+    /// holds more history than `capacity`.
     pub fn open_session(&self, path: impl AsRef<Path>, capacity: usize) -> Result<Session> {
         Session::open(&self.inner, path.as_ref(), capacity)
     }

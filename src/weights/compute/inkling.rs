@@ -88,6 +88,7 @@ pub struct Qkv {
     pub conv: u32,
     pub taps: u32,
     pub conv_scale: f32,
+    pub ring: u32,
 }
 
 #[repr(C)]
@@ -100,6 +101,7 @@ struct Attention {
     m: u32,
     extent: u32,
     scale: f32,
+    ring: u32,
 }
 
 #[repr(C)]
@@ -482,7 +484,7 @@ impl Bindings<'_> {
             &BufferView,
             &BufferView,
         ),
-        kv: &Kv,
+        (kv, ring): (&Kv, usize),
         conv: Option<QkvConv<'_>>,
         pos: usize,
         rows: usize,
@@ -509,6 +511,7 @@ impl Bindings<'_> {
             },
             conv_scale: 1.0
                 / ((if layer.full { 2.0 } else { 1.0 }) * plan.taps as f32 + 1.0).sqrt(),
+            ring: ring as u32,
         };
         let items = rows * (2 * plan.heads + 2 * plan.kv_heads);
         let dummy = r.binding();
@@ -554,7 +557,7 @@ impl Bindings<'_> {
             &BufferView,
             &BufferView,
         ),
-        kv: &Kv,
+        (kv, ring): (&Kv, usize),
         pos: usize,
         rows: usize,
     ) {
@@ -567,6 +570,7 @@ impl Bindings<'_> {
             // Each layer's bias table covers its own extent: the window on SWA layers.
             extent: if layer.full { plan.extent } else { plan.window } as u32,
             scale: 1.0 / (plan.dim as f32).sqrt(),
+            ring: ring as u32,
         };
         dispatch(
             self.encoder,

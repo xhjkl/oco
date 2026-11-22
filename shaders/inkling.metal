@@ -265,13 +265,14 @@ struct InklingQkv {
     uint conv;          // single row: convolve raw keys and values here (with their state)
     uint taps;          // dynamic taps per KV head (full-attention layers), else zero
     float conv_scale;
+    uint ring;          // rows of a sliding-window ring cache (position p at row p % ring), or 0
 };
 
 // Per head vector, one SIMD group each: clip queries (after their per-channel scale) and keys to
 // an L2 norm of at most `clip`, RMS-normalize values without gains, clip the relative vectors
 // (after their scale) to `rel_clip`, and log-scale queries and relative vectors by position on
-// full-attention layers. Keys and values go to the cache as half at their sequence positions;
-// queries stay BF16 in place and relative vectors become FP32.
+// full-attention layers. Keys and values go to the cache as half at their sequence positions (or
+// their ring rows); queries stay BF16 in place and relative vectors become FP32.
 [[kernel, max_total_threads_per_threadgroup(256)]] void
 inkling_qkv(device bfloat *q [[buffer(0)]], const device bfloat *k [[buffer(1)]],
             const device bfloat *v [[buffer(2)]], const device bfloat *r [[buffer(3)]],
@@ -286,7 +287,7 @@ inkling_qkv(device bfloat *q [[buffer(0)]], const device bfloat *k [[buffer(1)]]
     const uint per_row = 2 * p.heads + 2 * p.kv_heads, item = group * 8 + sg;
     if (item >= p.m * per_row)
         return;
-    const uint t = item / per_row, j = item % per_row, pos = p.pos + t;
+    const uint t = item / per_row, j = item % per_row, pos = p.pos + t, row = p.ring ? pos % p.ring : pos;
     const float tau = p.scaled ? 1.0f + p.alpha * log(max(1.0f, float(pos + 1) / float(p.floor))) : 1.0f;
     constexpr uint E = 4; // 128-wide heads over 32 lanes
     if (j < p.heads + 2 * p.kv_heads) {
@@ -338,14 +339,14 @@ inkling_qkv(device bfloat *q [[buffer(0)]], const device bfloat *k [[buffer(1)]]
                 for (uint e = 0; e < E; e++)
                     dst[e] = bfloat(x[e] * f * tau);
             } else {
-                device half *dst = k_cache + (ulong(pos) * p.kv_heads + h) * p.dim + lane * E;
+                device half *dst = k_cache + (ulong(row) * p.kv_heads + h) * p.dim + lane * E;
 #pragma unroll
                 for (uint e = 0; e < E; e++)
                     dst[e] = half(x[e] * f);
             }
         } else {
             float f = rsqrt(sq / float(p.dim) + p.epsilon);
-            device half *dst = v_cache + (ulong(pos) * p.kv_heads + h) * p.dim + lane * E;
+            device half *dst = v_cache + (ulong(row) * p.kv_heads + h) * p.dim + lane * E;
 #pragma unroll
             for (uint e = 0; e < E; e++)
                 dst[e] = half(x[e] * f);
@@ -366,6 +367,7 @@ inkling_qkv(device bfloat *q [[buffer(0)]], const device bfloat *k [[buffer(1)]]
 struct InklingAttention {
     uint heads, kv_heads, pos, window, m, extent;
     float scale;
+    uint ring; // rows of a sliding-window ring cache (position s at row s % ring), or 0
 };
 
 // Single-query and short-batch attention over 128-wide heads, after attention_vector: eight lanes
@@ -404,9 +406,12 @@ inkling_attention(const device bfloat *q [[buffer(0)]], const device half *k [[b
     bool seed = state == 0;
     float mx = seed ? float(sinks[t * p.heads + h]) : -INFINITY, sm = seed ? 1.0f : 0.0f;
     uint qpos = p.pos + t, end = qpos + 1, begin = p.window && end > p.window ? end - p.window : 0;
-    for (uint s = begin + state; s < end; s += STATES) {
-        const device uint4 *kp = reinterpret_cast<const device uint4 *>(k + (s * p.kv_heads + kv) * D + key_lane * PER_LANE);
-        const device uint4 *vp = reinterpret_cast<const device uint4 *>(v + (s * p.kv_heads + kv) * D + key_lane * PER_LANE);
+    // Cache rows advance with positions and wrap at the ring size (never, for linear caches).
+    const uint wrap = p.ring ? p.ring : 0xffffffffu;
+    uint row = p.ring ? (begin + state) % p.ring : begin + state;
+    for (uint s = begin + state; s < end; s += STATES, row = row + STATES >= wrap ? row + STATES - wrap : row + STATES) {
+        const device uint4 *kp = reinterpret_cast<const device uint4 *>(k + (row * p.kv_heads + kv) * D + key_lane * PER_LANE);
+        const device uint4 *vp = reinterpret_cast<const device uint4 *>(v + (row * p.kv_heads + kv) * D + key_lane * PER_LANE);
         uint4 kw[VECTORS], vw[VECTORS];
 #pragma unroll
         for (uint i = 0; i < VECTORS; i++) {
