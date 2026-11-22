@@ -129,6 +129,21 @@ impl ReadOnly {
         (&self.buffer, self.offset)
     }
 
+    /// Copy the first bytes of this view to the host, for load-time checks of weights.
+    pub fn read<T: Pod>(&self, values: &mut [T]) {
+        let bytes = bytemuck::cast_slice_mut(values);
+        assert!(bytes.len() <= self.length, "read exceeds the view");
+        unsafe {
+            let base = self.buffer.contents().as_ptr() as *const u8;
+            std::ptr::copy_nonoverlapping(base.add(self.offset), bytes.as_mut_ptr(), bytes.len());
+        }
+    }
+
+    /// Bytes in this view.
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
     /// Narrow this view to a byte range within it.
     pub fn slice(&self, offset: usize, length: usize) -> ReadOnly {
         assert!(offset <= self.length && length <= self.length - offset);

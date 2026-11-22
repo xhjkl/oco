@@ -69,6 +69,8 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
     let rel_clip = p.number("attention.relative_clip")? as f32;
     let floor = p.integer("attention.log_scale_floor")?;
     let alpha = p.number("attention.log_scale_alpha")? as f32;
+    // The layer loop's operands reuse these names; the table check needs the scalars.
+    let (rel_width, rel_bound) = (rel, rel_clip);
     let route_scale = p.optional("expert_weights_scale", 1.0)? as f32;
     let situ_beta = p.number("activation.situ_beta")? as f32;
     let situ_linear_beta = p.number("activation.situ_linear_beta")? as f32;
@@ -312,6 +314,31 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
         let [router, router_bias] = l.router;
         let [gate_up, down] = l.experts;
         let expert_bank = usize::from(gate_up.kind == WeightFormat::Q8_0);
+        let rel_table = i.binding(rel_table)?;
+        // The tensor prompt tiles stage the table as half: only for tables whose rounding moves
+        // no bias by more than 1e-4 for the largest relative vector the layer can see (clipped,
+        // then log-scaled at the context limit on full layers). The released checkpoint's
+        // entries are BF16 values below 2, exact in half but for errors under 3e-8 in its
+        // smallest entries.
+        let table_half = {
+            let mut values = vec![0f32; rel_table.length() / 4];
+            rel_table.read(&mut values);
+            let row_error = values
+                .chunks(rel_width)
+                .map(|row| {
+                    let squares: f32 = row
+                        .iter()
+                        .map(|&v| (half::f16::from_f32(v).to_f32() - v).powi(2))
+                        .sum();
+                    squares.sqrt()
+                })
+                .fold(0f32, f32::max);
+            let tau = match l.full {
+                true => 1.0 + alpha * (context as f32 / floor as f32).max(1.0).ln(),
+                false => 1.0,
+            };
+            values.iter().all(|v| v.is_finite()) && row_error * rel_bound * tau <= 1e-4
+        };
         layers.push(InklingLayer {
             full: l.full,
             norms,
@@ -327,7 +354,8 @@ pub fn load(file: &Gguf, p: &Parameters<'_>) -> Result<Architecture> {
             v_taps,
             q_clip: i.binding(q_clip)?,
             rel_clip: i.binding(rel_clip)?,
-            rel_table: i.binding(rel_table)?,
+            rel_table,
+            table_half,
             k_conv: i.binding(k_conv)?,
             v_conv: i.binding(v_conv)?,
             out_conv: i.binding(out_conv)?,

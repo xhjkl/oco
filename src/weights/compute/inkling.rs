@@ -93,16 +93,25 @@ pub struct Qkv {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct Attention {
-    heads: u32,
-    kv_heads: u32,
-    pos: u32,
-    window: u32,
-    m: u32,
-    extent: u32,
-    scale: f32,
-    ring: u32,
+pub struct InklingAttention {
+    pub heads: u32,
+    pub kv_heads: u32,
+    pub pos: u32,
+    pub window: u32,
+    pub m: u32,
+    pub extent: u32,
+    pub scale: f32,
+    pub ring: u32,
 }
+
+/// Fewest prompt rows that take the tensor attention tiles: on M5 Pro, 16-row appends at 8k
+/// depth already ran 9% faster than the vector kernel (48 rows: 19%).
+const TENSOR_ATTENTION_ROWS: usize = 16;
+/// Fewest visible keys at which a single query splits them across threadgroups, without and
+/// with tensor hardware, and into how many chunks.
+const SPLIT_KEYS: usize = 16384;
+const SPLIT_KEYS_TENSOR: usize = 32768;
+const SPLIT_CHUNKS: usize = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -561,7 +570,7 @@ impl Bindings<'_> {
         pos: usize,
         rows: usize,
     ) {
-        let p = Attention {
+        let p = InklingAttention {
             heads: plan.heads as u32,
             kv_heads: plan.kv_heads as u32,
             pos: pos as u32,
@@ -572,23 +581,99 @@ impl Bindings<'_> {
             scale: 1.0 / (plan.dim as f32).sqrt(),
             ring: ring as u32,
         };
-        dispatch(
-            self.encoder,
-            &plan.pipelines.attention,
-            &[
+        // Single queries over long histories split the keys into chunks across threadgroups.
+        let visible = pos + 1;
+        let visible = if layer.full {
+            visible
+        } else {
+            visible.min(plan.window)
+        };
+        // Measured on M5 Pro, split decode pays from 32k keys (+2.7% there, +9% at 128k) and the
+        // vector kernel wins below; on M1 Max it already gains at 16k.
+        let threshold = match plan.pipelines.attention_tensor {
+            Some(_) => SPLIT_KEYS_TENSOR,
+            None => SPLIT_KEYS,
+        };
+        let chunks = SPLIT_CHUNKS;
+        if rows == 1
+            && visible >= threshold
+            && chunks * plan.heads * (plan.dim + 2) * 4 <= self.scratch.partials.length()
+        {
+            // Sharing keys across a KV head's three query heads measured 10% faster than one head
+            // per threadgroup at 32k on M5 Pro; any other ratio takes one head per group.
+            let grouped = plan.heads == 3 * plan.kv_heads;
+            let (pipeline, groups) = match grouped {
+                true => (&plan.pipelines.split[1], plan.kv_heads),
+                false => (&plan.pipelines.split[0], plan.heads),
+            };
+            let partials = self.scratch.partials.binding();
+            let buffers = [
                 q.binding(),
                 kv.k.binding(),
                 kv.v.binding(),
                 r.binding(),
                 layer.rel_table.binding(),
-                sinks.binding(),
-                gate.binding(),
-                out.binding(),
-            ],
-            bytes_of(&p),
-            [plan.heads, rows, 1],
-            256,
-        );
+                partials,
+            ];
+            dispatch(
+                self.encoder,
+                pipeline,
+                &buffers,
+                bytes_of(&p),
+                [groups, chunks, 1],
+                256,
+            );
+            // The merge reads the chunk count from `m`, which a single query leaves free.
+            let merge = InklingAttention {
+                m: chunks as u32,
+                ..p
+            };
+            let buffers = [partials, sinks.binding(), gate.binding(), out.binding()];
+            dispatch(
+                self.encoder,
+                &plan.pipelines.merge,
+                &buffers,
+                bytes_of(&merge),
+                [plan.heads, 1, 1],
+                128,
+            );
+            return;
+        }
+        let buffers = [
+            q.binding(),
+            kv.k.binding(),
+            kv.v.binding(),
+            r.binding(),
+            layer.rel_table.binding(),
+            sinks.binding(),
+            gate.binding(),
+            out.binding(),
+        ];
+        // Prompts take 32-query tensor tiles on Apple10, whose 128-key steps never straddle a
+        // ring's wrap; single queries and short batches take the vector kernel.
+        let tensor = plan
+            .pipelines
+            .attention_tensor
+            .as_ref()
+            .filter(|_| rows >= TENSOR_ATTENTION_ROWS && layer.table_half && ring % 128 == 0);
+        match tensor {
+            Some(pipeline) => dispatch(
+                self.encoder,
+                pipeline,
+                &buffers,
+                bytes_of(&p),
+                [plan.heads, rows.div_ceil(32), 1],
+                256,
+            ),
+            None => dispatch(
+                self.encoder,
+                &plan.pipelines.attention,
+                &buffers,
+                bytes_of(&p),
+                [plan.heads, rows, 1],
+                256,
+            ),
+        }
     }
 
     /// Route each normalized row (in `scratch.norm`) to its experts and leave their SITU

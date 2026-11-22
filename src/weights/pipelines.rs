@@ -78,6 +78,12 @@ pub struct InklingPipelines {
     pub conv: Pipeline,
     pub qkv: Pipeline,
     pub attention: Pipeline,
+    /// Prompt attention on tensor operations (Apple10).
+    pub attention_tensor: Option<Pipeline>,
+    /// Split-key single-query attention with one or three query heads per threadgroup, and the
+    /// merge of its chunks.
+    pub split: [Pipeline; 2],
+    pub merge: Pipeline,
     pub situ: Pipeline,
     pub combine: Pipeline,
     pub router_logits: Pipeline,
@@ -537,6 +543,15 @@ impl Builder {
             conv: self.get("inkling_conv", F32, 0)?,
             qkv: self.get("inkling_qkv", F32, 0)?,
             attention: self.get("inkling_attention", F32, 0)?,
+            split: [
+                self.get("inkling_split_1", F32, 0)?,
+                self.get("inkling_split_3", F32, 0)?,
+            ],
+            merge: self.get("inkling_merge", F32, 0)?,
+            attention_tensor: match self.tensor {
+                true => Some(self.get("inkling_attention_tensor", F32, 0)?),
+                false => None,
+            },
             situ: self.get("inkling_situ", F32, 0)?,
             combine: self.get("inkling_combine", F32, 0)?,
             router_logits: self.get("inkling_router_logits", F32, 0)?,

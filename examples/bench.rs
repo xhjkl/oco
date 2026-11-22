@@ -1,5 +1,7 @@
 //! Prefill and decode throughput for one checkpoint, comparable to llama-bench's pp/tg rows.
-//! Usage: bench MODEL.gguf [PROMPT_TOKENS=512] [GENERATED_TOKENS=128] [REPEATS=3]
+//! Usage: bench MODEL.gguf [PROMPT_TOKENS=512] [GENERATED_TOKENS=128] [REPEATS=3] [DEPTH=0]
+//! With a depth, each repeat first consumes that many context tokens untimed, then times the
+//! prompt appended after them and decoding past it (llama-bench's `-d`).
 use std::error::Error;
 use std::time::Instant;
 
@@ -8,27 +10,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
-        .ok_or("usage: bench MODEL.gguf [PROMPT] [GENERATED] [REPEATS]")?;
+        .ok_or("usage: bench MODEL.gguf [PROMPT] [GENERATED] [REPEATS] [DEPTH]")?;
     let prompt_tokens: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(512);
     let generated: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(128);
     let repeats: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(3);
+    let depth: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(0);
     let started = Instant::now();
     let weights = oco::load(&path)?;
     eprintln!("loaded {path} in {:.2?}", started.elapsed());
     let tokenizer = weights.tokenizer();
     let text = "The quick brown fox jumps over the lazy dog while the engineer inspects log files, counts tokens, and measures memory bandwidth on Apple Silicon. ";
     let mut prompt = Vec::new();
-    while prompt.len() < prompt_tokens {
+    while prompt.len() < prompt_tokens + depth {
         prompt.extend(tokenizer.encode(text)?);
     }
-    prompt.truncate(prompt_tokens);
-    if prompt.len() != prompt_tokens {
+    prompt.truncate(prompt_tokens + depth);
+    if prompt.len() != prompt_tokens + depth {
         return Err("prompt too short".into());
     }
+    let context = prompt.drain(..depth).collect::<Vec<_>>();
     let mut prefill_rates = Vec::new();
     let mut decode_rates = Vec::new();
     for repeat in 0..repeats {
-        let mut session = weights.new_session(prompt_tokens + generated)?;
+        let mut session = weights.new_session(depth + prompt_tokens + generated)?;
+        if depth > 0 {
+            session.infer(context.clone())?.next().await?;
+            // Dropping the untimed context's kernel totals.
+            let _ = oco::profile_report();
+        }
         let mut inference = session.infer(prompt.clone())?;
         let begin = Instant::now();
         let first = inference.next().await?.ok_or("no prediction")?;
@@ -65,9 +74,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         decode_rates.push(tg);
     }
     let best = |rates: &[f64]| rates.iter().cloned().fold(0.0, f64::max);
+    // Decoding starts after the prompt, so its depth includes it.
+    let (at, tg_at) = match depth {
+        0 => (String::new(), String::new()),
+        _ => (format!("@d{depth}"), format!("@d{}", depth + prompt_tokens)),
+    };
     let mean = |rates: &[f64]| rates.iter().sum::<f64>() / rates.len() as f64;
     println!(
-        "{}\tpp{prompt_tokens}\tmean {:.2}\tbest {:.2}\ttg{generated}\tmean {:.2}\tbest {:.2}",
+        "{}\tpp{prompt_tokens}{at}\tmean {:.2}\tbest {:.2}\ttg{generated}{tg_at}\tmean {:.2}\tbest {:.2}",
         std::path::Path::new(&path)
             .file_name()
             .and_then(|name| name.to_str())

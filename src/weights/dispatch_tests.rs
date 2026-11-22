@@ -2,6 +2,7 @@ mod attention;
 mod attention_tensor;
 mod audio;
 mod dense_bench;
+mod inkling;
 mod matrix_precision;
 mod mxfp4;
 mod nemotron;

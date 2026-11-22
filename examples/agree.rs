@@ -1,5 +1,7 @@
 //! Teacher-forced agreement: feed a token sequence and count how often Oco's greedy prediction
 //! matches the token that actually follows. Usage: agree MODEL.gguf PROMPT_LEN ID ID ID ...
+//! Without IDs on the command line, they are read whitespace-separated from stdin (long
+//! sequences exceed the argument limit).
 use std::error::Error;
 
 #[tokio::main(flavor = "current_thread")]
@@ -9,7 +11,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .next()
         .ok_or("usage: agree MODEL.gguf PROMPT_LEN IDS...")?;
     let prompt_len: usize = args.next().ok_or("PROMPT_LEN")?.parse()?;
-    let ids: Vec<u32> = args.map(|s| s.parse()).collect::<Result<_, _>>()?;
+    let mut ids: Vec<u32> = args.map(|s| s.parse()).collect::<Result<_, _>>()?;
+    if ids.is_empty() {
+        let text = std::io::read_to_string(std::io::stdin())?;
+        ids = text
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()?;
+    }
     if ids.len() <= prompt_len + 1 {
         return Err("need tokens after the prompt".into());
     }

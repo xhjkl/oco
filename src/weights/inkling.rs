@@ -50,6 +50,8 @@ pub struct InklingLayer {
     pub q_clip: ReadOnly,
     pub rel_clip: ReadOnly,
     pub rel_table: ReadOnly,
+    /// Whether every table entry survives the half the tensor prompt tiles stage it as.
+    pub table_half: bool,
     pub k_conv: ReadOnly,
     pub v_conv: ReadOnly,
     pub out_conv: ReadOnly,

@@ -473,6 +473,308 @@ inkling_attention(const device bfloat *q [[buffer(0)]], const device half *k [[b
     }
 }
 
+// Prompt attention on Metal 4 tensor operations (Apple10), after attention_tensor: 32 queries of
+// one head per threadgroup, 128 keys per step, eight SIMD groups, an FP32 online softmax with
+// scaled half probabilities and lazy rescaling. Each score adds the query's relative-position bias r . table[d]
+// for distances below the extent, per element in the softmax pass: the step's 159 distances of
+// table rows are staged as half beside the score tiles, and the 32 queries' relative vectors as
+// FP32. Per-query sinks join the mass at the end, and the output is gated by sigmoid(gate). The
+// first key tile starts exactly at the first query's window, so expired cache rows never enter a
+// product, and every tile ends at an absolute multiple of 128: on a ring of a multiple of 128
+// rows a tile never straddles the wrap.
+[[kernel, max_total_threads_per_threadgroup(256)]] void
+inkling_attention_tensor(const device bfloat *q [[buffer(0)]], device half *k [[buffer(1)]],
+                         device half *v [[buffer(2)]], const device float *r [[buffer(3)]],
+                         const device float *table [[buffer(4)]], const device bfloat *sinks [[buffer(5)]],
+                         const device bfloat *gate [[buffer(6)]], device bfloat *out [[buffer(7)]],
+                         constant InklingAttention &p [[buffer(8)]],
+                         uint3 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int D = 128, Q = 32, C = 128, NSG = 8, NQ = Q / NSG, NC = C / 32, REL = 16, BAND = Q + C - 1;
+    // Probabilities are stored as half scaled by S, and the running maximum moves once a row's
+    // scores exceed it by GAP, so S exp(GAP) stays within half and keys far below the maximum
+    // (a long context's weak tail) stay normal halves instead of flushing to zero.
+    constexpr float S = 32768.0f, GAP = 0.5f;
+    threadgroup float ss[Q * C];
+    threadgroup half sp[Q * C];
+    // Declared as vectors so the bias dot reads aligned four-wide slices.
+    threadgroup half4 band4[BAND * REL / 4];
+    threadgroup float4 rel4[Q * REL / 4];
+    threadgroup half *band = (threadgroup half *)band4;
+    threadgroup float *rel = (threadgroup float *)rel4;
+    threadgroup float sr[Q], sd[Q];
+    threadgroup atomic_uint rescaled;
+    const uint h = group.x, t0 = group.y * Q, kv = h / (p.heads / p.kv_heads);
+    const uint rows = min(uint(Q), p.m - t0);
+    // Absolute positions: queries at p.pos + t0 + j see keys through their own position.
+    const uint q0 = p.pos + t0, end = q0 + rows;
+    const uint begin = p.window && q0 + 1 > p.window ? q0 + 1 - p.window : 0;
+    for (uint i = tid; i < Q * REL; i += 256) {
+        uint j = i / REL;
+        rel[i] = j < rows ? r[((t0 + j) * p.heads + h) * REL + i % REL] : 0.0f;
+    }
+    float peak[NQ], mass[NQ];
+#pragma unroll
+    for (int jj = 0; jj < NQ; ++jj) {
+        peak[jj] = -FLT_MAX / 2;
+        mass[jj] = 0;
+    }
+    const int stride = int(p.kv_heads * D);
+    device half *keys = k + kv * D, *values = v + kv * D;
+    auto tq = tensor(const_cast<device bfloat *>(q) + (t0 * p.heads + h) * D, dextents<int32_t, 2>(D, int(rows)),
+                     array<int, 2>({1, int(p.heads * D)}));
+    auto ts = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(ss, dextents<int32_t, 2>(C, Q));
+    auto tp = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sp, dextents<int32_t, 2>(C, Q));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(Q, C, D, false, true, false,
+                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<NSG>> mm_qk;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(Q, D, static_cast<int>(dynamic_extent), false, false, false,
+                                             mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<NSG>> mm_pv;
+    auto tv0 = tensor(values, dextents<int32_t, 2>(D, C), array<int, 2>({1, stride}));
+    // Each step's weighted values land in their own FP32 tile and join the running output with
+    // ordinary adds: accumulating a long context's weak tail inside the tensor operation onto a
+    // large running sum lost about 4% of it over 1M keys (Astra's review).
+    auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
+    auto ct = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
+#pragma unroll
+    for (uint16_t i = 0; i < co.get_capacity(); ++i)
+        if (co.is_valid_element(i))
+            co[i] = 0;
+    if (tid == 0)
+        atomic_store_explicit(&rescaled, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint step = 0;
+    for (uint ic = begin; ic < end; ic = (ic / C + 1) * C, ++step) {
+        const int live = int(min((ic / C + 1) * C, end) - ic);
+        const uint row = p.ring ? ic % p.ring : ic;
+        // Distances in this step run from q0 - (ic + C - 1) (band row 0) up to q0 + Q - 1 - ic.
+        // Steps wholly past the extent (most of a deep full-attention history) carry no bias.
+        const int nearest = int(q0) - int(ic + C - 1);
+        const bool biased = int(q0) - int(ic + live - 1) < int(p.extent);
+        if (biased) {
+            for (uint i = tid; i < BAND * REL; i += 256) {
+                int d = nearest + int(i / REL);
+                band[i] = d >= 0 && uint(d) < p.extent ? half(table[uint(d) * REL + i % REL]) : half(0);
+            }
+        }
+        auto tk = tensor(keys + row * stride, dextents<int32_t, 2>(D, live), array<int, 2>({1, stride}));
+        mm_qk.run(tq, tk, ts);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (int jj = 0; jj < NQ; ++jj) {
+            const uint j = jj * NSG + sg, t = q0 + j;
+            const uint row_begin = p.window && t + 1 > p.window ? t + 1 - p.window : 0;
+            float s[NC];
+            float m = peak[jj];
+#pragma unroll
+            for (int ii = 0; ii < NC; ++ii) {
+                uint column = ii * 32 + lane, key = ic + column;
+                bool visible = j < rows && int(column) < live && key <= t && key >= row_begin;
+                float bias = 0;
+                if (visible && biased) {
+                    // Band row of distance t - key: (t - key) - nearest = j + C - 1 - column.
+                    const threadgroup half4 *tb = band4 + (j + C - 1 - column) * (REL / 4);
+                    const threadgroup float4 *rj = rel4 + j * (REL / 4);
+#pragma unroll
+                    for (int e = 0; e < REL / 4; ++e)
+                        bias += dot(rj[e], float4(tb[e]));
+                }
+                s[ii] = visible ? fma(ss[j * C + column], p.scale, bias) : -INFINITY;
+                m = max(m, s[ii]);
+            }
+            m = simd_max(m);
+            float scale = 1.0f;
+            // The difference, not peak + GAP, which rounds back to peak for peaks near 2^23.
+            if (m - peak[jj] > GAP) {
+                scale = fast::exp(peak[jj] - m);
+                peak[jj] = m;
+                if (lane == 0)
+                    atomic_store_explicit(&rescaled, step + 1, memory_order_relaxed);
+            }
+            float sum = 0;
+#pragma unroll
+            for (int ii = 0; ii < NC; ++ii) {
+                half probability = half(S * fast::exp(s[ii] - peak[jj]));
+                sp[j * C + ii * 32 + lane] = probability;
+                sum += float(probability);
+            }
+            mass[jj] = mass[jj] * scale + simd_sum(sum);
+            if (lane == 0)
+                sr[j] = scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto tpl = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
+            sp, dextents<int32_t, 2>(live, Q), array<int, 2>({1, C}));
+        auto tv = tensor(values + row * stride, dextents<int32_t, 2>(D, live), array<int, 2>({1, stride}));
+        mm_pv.run(tpl, tv, ct);
+        const bool rescale = atomic_load_explicit(&rescaled, memory_order_relaxed) == step + 1;
+#pragma unroll
+        for (uint16_t i = 0; i < co.get_capacity(); ++i)
+            if (co.is_valid_element(i))
+                co[i] = (rescale ? co[i] * sr[co.get_multidimensional_index(i)[1]] : co[i]) + ct[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#pragma unroll
+    for (int jj = 0; jj < NQ; ++jj) {
+        const uint j = jj * NSG + sg;
+        float sink = j < rows ? float(sinks[(t0 + j) * p.heads + h]) : 0.0f, m = max(peak[jj], sink);
+        float scale = fast::exp(peak[jj] - m);
+        float total = mass[jj] * scale + S * fast::exp(sink - m);
+        // Scaling before dividing, so a dominant sink cannot flush a representable output.
+        if (lane == 0) {
+            sr[j] = scale;
+            sd[j] = 1.0f / total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (uint16_t i = 0; i < co.get_capacity(); ++i) {
+        if (!co.is_valid_element(i))
+            continue;
+        auto at = co.get_multidimensional_index(i);
+        uint d = at[0], j = at[1];
+        if (j < rows) {
+            uint o = ((t0 + j) * p.heads + h) * D + d;
+            out[o] = bfloat(co[i] * sr[j] * sd[j] / (1.0f + exp(-float(gate[o]))));
+        }
+    }
+}
+
+// Single-query attention split across `chunks` threadgroups per KV head (flash decoding), after
+// attention_split: G query heads share each key, every SIMD group takes one key per step with
+// four dimensions per lane, and the 16-term relative bias rides in the dot product's reduction
+// (lanes 0-15 add one term each). Each threadgroup leaves its chunk's running maximum, mass and
+// unnormalized output per head for inkling_merge, which adds the sink and the gate.
+template <uint G>
+[[kernel, max_total_threads_per_threadgroup(256)]] void
+inkling_split(const device bfloat *q [[buffer(0)]], const device half *k [[buffer(1)]],
+              const device half *v [[buffer(2)]], const device float *r [[buffer(3)]],
+              const device float *table [[buffer(4)]], device float *partials [[buffer(5)]],
+              constant InklingAttention &p [[buffer(6)]], uint3 group [[threadgroup_position_in_grid]],
+              uint3 grid [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]],
+              uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint D = 128, PER = D / 32, REL = 16;
+    threadgroup float stats[8 * G * 2];
+    threadgroup float merged[8 * D];
+    const uint kv = group.x * G / (p.heads / p.kv_heads), first_head = group.x * G;
+    const uint chunk = group.y, chunks = grid.y;
+    const uint qpos = p.pos, end = qpos + 1, begin = p.window && end > p.window ? end - p.window : 0;
+    const uint span = (end - begin + chunks - 1) / chunks;
+    const uint first = begin + chunk * span, last = min(first + span, end);
+    float qq[G][PER], oo[G][PER], rr[G], mx[G], sm[G];
+#pragma unroll
+    for (uint g = 0; g < G; ++g) {
+        const uint h = first_head + g;
+        const device bfloat *qp = q + h * D + lane * PER;
+#pragma unroll
+        for (uint j = 0; j < PER; ++j) {
+            qq[g][j] = float(qp[j]) * p.scale;
+            oo[g][j] = 0;
+        }
+        rr[g] = lane < REL ? r[h * REL + lane] : 0.0f;
+        mx[g] = -FLT_MAX / 2;
+        sm[g] = 0;
+    }
+    const uint wrap = p.ring ? p.ring : 0xffffffffu;
+    uint row = p.ring ? (first + sg) % p.ring : first + sg;
+    for (uint s = first + sg; s < last; s += 8, row = row + 8 >= wrap ? row + 8 - wrap : row + 8) {
+        const device half *kp = k + (row * p.kv_heads + kv) * D + lane * PER;
+        const device half *vp = v + (row * p.kv_heads + kv) * D + lane * PER;
+        float kk[PER], vv[PER];
+#pragma unroll
+        for (uint j = 0; j < PER; ++j) {
+            kk[j] = float(kp[j]);
+            vv[j] = float(vp[j]);
+        }
+        const uint distance = qpos - s;
+        const float tb = lane < REL && distance < p.extent ? table[distance * REL + lane] : 0.0f;
+#pragma unroll
+        for (uint g = 0; g < G; ++g) {
+            float score = rr[g] * tb;
+#pragma unroll
+            for (uint j = 0; j < PER; ++j)
+                score = fma(qq[g][j], kk[j], score);
+            score = simd_sum(score);
+            float nm = max(mx[g], score), f = fast::exp(mx[g] - nm), e = fast::exp(score - nm);
+            sm[g] = sm[g] * f + e;
+            mx[g] = nm;
+#pragma unroll
+            for (uint j = 0; j < PER; ++j)
+                oo[g][j] = oo[g][j] * f + e * vv[j];
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (uint g = 0; g < G; ++g) {
+            stats[(sg * G + g) * 2] = mx[g];
+            stats[(sg * G + g) * 2 + 1] = sm[g];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (uint g = 0; g < G; ++g) {
+        float peak = -FLT_MAX / 2;
+        for (uint i = 0; i < 8; ++i)
+            peak = max(peak, stats[(i * G + g) * 2]);
+        float own = fast::exp(mx[g] - peak);
+#pragma unroll
+        for (uint j = 0; j < PER; ++j)
+            merged[sg * D + lane * PER + j] = oo[g][j] * own;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device float *out = partials + ((first_head + g) * chunks + chunk) * (D + 2);
+        for (uint d = tid; d < D; d += 256) {
+            float value = 0;
+            for (uint i = 0; i < 8; ++i)
+                value += merged[i * D + d];
+            out[2 + d] = value;
+        }
+        if (tid == 0) {
+            float mass = 0;
+            for (uint i = 0; i < 8; ++i)
+                mass += stats[(i * G + g) * 2 + 1] * fast::exp(stats[(i * G + g) * 2] - peak);
+            out[0] = peak;
+            out[1] = mass;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+#define INKLING_SPLIT(G)                                                                           \
+    template [[host_name("inkling_split_" #G)]] kernel void inkling_split<G>(                      \
+        const device bfloat *, const device half *, const device half *, const device float *,     \
+        const device float *, device float *, constant InklingAttention &, uint3, uint3, uint, uint, \
+        uint);
+INKLING_SPLIT(1)
+INKLING_SPLIT(3)
+
+// Combine inkling_split's `p.m` chunk partials per head with the head's sink, then gate.
+[[kernel, max_total_threads_per_threadgroup(128)]] void
+inkling_merge(const device float *partials [[buffer(0)]], const device bfloat *sinks [[buffer(1)]],
+              const device bfloat *gate [[buffer(2)]], device bfloat *out [[buffer(3)]],
+              constant InklingAttention &p [[buffer(4)]], uint h [[threadgroup_position_in_grid]],
+              uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint D = 128;
+    const uint chunks = p.m;
+    const device float *base = partials + h * chunks * (D + 2);
+    const float sink = float(sinks[h]);
+    float peak = sink;
+    for (uint c = 0; c < chunks; ++c)
+        peak = max(peak, base[c * (D + 2)]);
+    float den = fast::exp(sink - peak);
+    for (uint c = 0; c < chunks; ++c)
+        den += base[c * (D + 2) + 1] * fast::exp(base[c * (D + 2)] - peak);
+    for (uint d = tid; d < D; d += 128) {
+        float value = 0;
+        for (uint c = 0; c < chunks; ++c)
+            value += base[c * (D + 2) + 2 + d] * fast::exp(base[c * (D + 2)] - peak);
+        uint o = h * D + d;
+        out[o] = bfloat(value / den / (1.0f + exp(-float(gate[o]))));
+    }
+}
+
 struct InklingSitu {
     uint width; // expert intermediate width (half of the merged gate/up rows)
     uint n;     // routes times width
